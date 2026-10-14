@@ -1,0 +1,39 @@
+import type { MessageKey } from "../../lib/i18n.js";
+import type { SharedSortKey } from "../../types/filters.js";
+
+interface InventoryListColumn {
+  key: string;
+  /** null on the artwork column, which carries no header text. */
+  labelKey: MessageKey | null;
+  /**
+   * The shared sort key this header writes. null means the column has no key in
+   * the shared sort store, so it renders as plain text instead of a button.
+   */
+  sortKey: SharedSortKey | null;
+  numeric: boolean;
+}
+
+export const INVENTORY_LIST_COLUMNS = [
+  { key: "icon", labelKey: null, sortKey: null, numeric: false },
+  { key: "name", labelKey: "common.name", sortKey: "name", numeric: false },
+  { key: "owned", labelKey: "common.owned", sortKey: "amount", numeric: true },
+  { key: "mastery", labelKey: "common.mastery", sortKey: null, numeric: false },
+  { key: "platinum", labelKey: "common.platinum", sortKey: "platinum", numeric: true },
+  { key: "ducats", labelKey: "common.ducats", sortKey: "ducats", numeric: true },
+  { key: "order", labelKey: "filters.orderPlaced", sortKey: null, numeric: false },
+] as const satisfies readonly InventoryListColumn[];
+
+/**
+ * The Owned cell shows a parts fraction for incomplete sets, so "amount" fits only
+ * a list with none; all-incomplete sorts by completeness, a mixed list by nothing.
+ */
+export function ownedSortKeyFor(groups: Iterable<string | null | undefined>): SharedSortKey | null {
+  let rows = 0;
+  let incomplete = 0;
+  for (const group of groups) {
+    rows += 1;
+    if (group === "incomplete_sets") incomplete += 1;
+  }
+  if (incomplete === 0) return "amount";
+  return incomplete === rows ? "missing_parts" : null;
+}

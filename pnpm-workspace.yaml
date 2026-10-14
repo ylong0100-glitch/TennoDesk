@@ -1,0 +1,32 @@
+# pnpm 11 reads its config from here, not .npmrc.
+
+# electron-builder + native modules (system-ocr, onnxruntime, sharp) don't
+# package correctly from pnpm's default symlinked store
+nodeLinker: hoisted
+
+# min age (in minutes) before a new release may be installed; 2880 = 48h.
+# cheap protection against freshly-compromised package versions
+minimumReleaseAge: 2880
+# admitted early for the 2026-09-24 relics; data-only package without install scripts
+minimumReleaseAgeExclude:
+  - "@wfcd/items@1.1276.6"
+
+overrides:
+  # electron-updater pins ^4.1.0; 4.3.2 closes the merge-key CPU advisory.
+  js-yaml: "^4.3.2"
+  # 0.6.1 closes the declared-uncompressed-size DoS (GHSA-7q85-xj36-vmfc).
+  adm-zip: ^0.6.1
+  esbuild: ^0.28.1
+  postcss: ^8.5.23
+  # major-scoped: minimatch 3.x needs the 1.x api, so don't collapse to one version
+  brace-expansion@1: ^1.1.16
+  brace-expansion@5: ^5.0.7
+
+# only these packages may run postinstall/build scripts
+allowBuilds:
+  electron: true
+  electron-winstaller: true
+  esbuild: true
+  koffi: true
+  onnxruntime-node: true
+  sharp: true

@@ -1,0 +1,207 @@
+<script lang="ts">
+  import { onMount } from "svelte";
+  import AnalysisEmpty from "./AnalysisEmpty.svelte";
+  import ItemImage from "../ItemImage.svelte";
+  import ThemedButton from "../ThemedButton.svelte";
+  import ThemedPanel from "../ThemedPanel.svelte";
+  import { locale, tr } from "../../lib/i18n.js";
+  import { log } from "../../lib/log.js";
+  import type { TopTradedDoc, TopTradedItem } from "../../../config/shared/topTraded.js";
+  import { loadTopTraded } from "../../lib/wfm/topTraded.js";
+  import { formatPlat } from "../../lib/stats/tradeAnalytics.js";
+  import { formatWfmAssetUrl, titleFromSlug } from "../../../config/shared/wfm.js";
+  import type { AnalyticsItemLink } from "../../lib/stats/analyticsItemLink.js";
+
+  interface Props {
+    itemLink: AnalyticsItemLink;
+  }
+
+  let { itemLink }: Props = $props();
+
+  type Mode = "volume" | "value";
+
+  let doc = $state<TopTradedDoc | null>(null);
+  let loading = $state(true);
+  let loadedAt = $state(0);
+  let mode = $state<Mode>("volume");
+
+  onMount(() => {
+    let cancelled = false;
+    void loadTopTraded()
+      .then((result) => {
+        if (cancelled) return;
+        doc = result;
+        loadedAt = Date.now();
+      })
+      .catch((e: unknown) => {
+        log.warn("[Analysis] top traded load failed:", e);
+      })
+      .finally(() => {
+        if (!cancelled) loading = false;
+      });
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  const rows = $derived.by(() => {
+    const current = doc;
+    if (!current) return [] as TopTradedItem[];
+    if (mode === "volume") return current.items;
+    const bySlug = new Map(current.items.map((item) => [item.slug, item]));
+    const ordered = current.byValue
+      .map((slug) => bySlug.get(slug))
+      .filter((item): item is TopTradedItem => item != null);
+    // A doc whose value order is missing or short still renders every item.
+    return ordered.length === current.items.length
+      ? ordered
+      : [...current.items].sort((a, b) => b.value - a.value);
+  });
+
+  // Split in reading order so the left column still runs 1..n/2 top to bottom.
+  const splitAt = $derived(Math.ceil(rows.length / 2));
+  const leftRows = $derived(rows.slice(0, splitAt));
+  const rightRows = $derived(rows.slice(splitAt));
+
+  const windowDays = $derived(doc?.windowDays ?? 7);
+
+  const updatedLabel = $derived.by(() => {
+    const translate = $tr;
+    const generatedAt = doc?.generatedAt ?? 0;
+    if (!generatedAt || !loadedAt) return "";
+    const ageSec = Math.max(0, Math.floor((loadedAt - generatedAt) / 1000));
+    if (ageSec < 60) return translate("common.updatedJustNow");
+    const ageMin = Math.floor(ageSec / 60);
+    if (ageMin < 60) return translate("common.updatedMAgo", { min: ageMin });
+    return translate("common.updatedHAgo", { hr: Math.floor(ageMin / 60) });
+  });
+</script>
+
+<ThemedPanel className="flex min-w-0 flex-col p-3">
+  <div class="flex min-w-0 flex-col gap-2" data-analysis-top-traded>
+    <div class="flex flex-wrap items-baseline justify-between gap-2">
+      <span class="text-xs font-semibold uppercase tracking-wide text-text-muted">
+        {$tr("analysis.topTraded.title")}
+      </span>
+      <span class="flex items-center gap-2">
+        {#if updatedLabel}
+          <span class="text-[0.65rem] text-text-muted" data-analysis-top-traded-updated>
+            {updatedLabel}
+          </span>
+        {/if}
+        <ThemedButton
+          active={mode === "volume"}
+          size="compact"
+          onClick={() => {
+            mode = "volume";
+          }}
+        >
+          {$tr("browse.volume")}
+        </ThemedButton>
+        <ThemedButton
+          active={mode === "value"}
+          size="compact"
+          onClick={() => {
+            mode = "value";
+          }}
+        >
+          {$tr("stats.valueLabel")}
+        </ThemedButton>
+      </span>
+    </div>
+
+    {#if loading}
+      <AnalysisEmpty messageKey="common.loading" />
+    {:else if rows.length === 0}
+      <AnalysisEmpty
+        messageKey="analysis.topTraded.empty"
+        marker="data-analysis-top-traded-empty"
+      />
+    {:else}
+      {#snippet rankedColumn(items: TopTradedItem[], offset: number)}
+        <div
+          class="grid grid-cols-[1.75rem_2rem_minmax(6rem,1fr)_auto_auto_auto] content-start items-center gap-x-3 gap-y-1"
+        >
+          <span></span>
+          <span></span>
+          <span class="text-[0.65rem] uppercase tracking-wide text-text-muted">
+            {$tr("common.name")}
+          </span>
+          <span class="text-right text-[0.65rem] uppercase tracking-wide text-text-muted">
+            {$tr("common.median")}
+          </span>
+          <span class="text-right text-[0.65rem] uppercase tracking-wide text-text-muted">
+            {$tr("browse.volume")}
+          </span>
+          <span class="text-right text-[0.65rem] uppercase tracking-wide text-text-muted">
+            {$tr("analysis.topTraded.value")}
+          </span>
+
+          {#each items as row, index (row.slug)}
+            {@const label = row.name || titleFromSlug(row.slug)}
+            {@const link = itemLink.resolve(row.slug, label)}
+            <span class="text-right text-[0.65rem] tabular-nums text-text-muted"
+              >{offset + index + 1}</span
+            >
+            <span
+              class="flex h-7 w-7 items-center justify-center overflow-hidden rounded border border-border/60 bg-surface-card"
+            >
+              <ItemImage
+                src={formatWfmAssetUrl(row.thumb)}
+                alt={label}
+                cls="max-h-6 max-w-6 object-contain"
+              />
+            </span>
+            <!-- The panel is a flat grid of cells, so the name is the row's handle. -->
+            {#if link}
+              <!-- The name truncates on an inner span; a button box does not
+                   hand text-overflow down to its own anonymous content box. -->
+              <button
+                type="button"
+                class="flex min-w-0 cursor-pointer rounded-[var(--radius-md)] border-0 bg-transparent p-0 text-left hover:bg-bg-raised"
+                title={label}
+                aria-label={$tr("common.openDetailsFor", { name: label })}
+                onclick={() => itemLink.open(link)}
+              >
+                <span class="truncate text-sm text-text-primary">{label}</span>
+              </button>
+            {:else}
+              <span class="truncate text-sm text-text-primary" title={label}>
+                {label}
+              </span>
+            {/if}
+            <span class="text-right text-xs tabular-nums text-text-secondary">
+              {formatPlat(row.median, $locale)}
+            </span>
+            <span class="text-right text-xs tabular-nums text-text-secondary">
+              {$tr("analysis.topTraded.perDay", {
+                count: (row.volume / windowDays).toLocaleString($locale, {
+                  maximumFractionDigits: 1,
+                }),
+              })}
+            </span>
+            <span
+              class="text-right text-xs font-semibold tabular-nums text-text-primary"
+              data-analysis-top-traded-value
+            >
+              {formatPlat(row.value, $locale)}
+            </span>
+          {/each}
+        </div>
+      {/snippet}
+
+      <!-- Two ranked columns once the panel is wide enough, so the numbers stay
+           next to the names instead of drifting across a full-width row. The
+           right padding is the scrollbar's gutter: the bar paints over content. -->
+      <div
+        class="grid max-h-[26rem] min-w-0 grid-cols-1 gap-x-6 overflow-y-auto pr-3 min-[1500px]:grid-cols-2"
+        data-analysis-top-traded-scroll
+      >
+        {@render rankedColumn(leftRows, 0)}
+        {#if rightRows.length > 0}
+          {@render rankedColumn(rightRows, splitAt)}
+        {/if}
+      </div>
+    {/if}
+  </div>
+</ThemedPanel>

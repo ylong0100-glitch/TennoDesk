@@ -1,0 +1,131 @@
+:root {
+  --bg-deep: #060a12;
+  --bg-base: #0a0e17;
+  --bg-surface: #111827;
+  --bg-raised: #1a2234;
+  --bg-hover: #1f2b3f;
+  --accent: #d4a843;
+  --accent-dim: #a07830;
+  --accent-glow: rgba(212, 168, 67, 0.15);
+  --accent-bright: #f0c95c;
+  --text-primary: #e8e4dc;
+  --text-secondary: #8b93a5;
+  --text-muted: #8d9ab3;
+  --success: #4ade80;
+  --warning: #fbbf24;
+  --danger: #f87171;
+  --info: #60a5fa;
+  --accent-blue: #60a5fa;
+  --border: rgba(212, 168, 67, 0.1);
+  --border-strong: rgba(212, 168, 67, 0.25);
+  --border-subtle: rgba(255, 255, 255, 0.12);
+
+  /* applyTheme() overwrites all of these at runtime; the literals here are the default preset. */
+  --surface-panel: #111827;
+  --surface-panel-border: rgba(212, 168, 67, 0.1);
+  --surface-card: #1a2234;
+  --surface-hover: rgba(255, 255, 255, 0.05);
+  --surface-selected: rgba(212, 168, 67, 0.15);
+  --surface-input: #1a2234;
+  --surface-tooltip: #060a12;
+
+  --text-heading: #e8e4dc;
+  --text-body: #e8e4dc;
+  --text-link: #d4a843;
+  --text-on-accent: #12151a;
+  --text-positive: #4ade80;
+  --text-negative: #f87171;
+
+  --success-dim: #329757;
+  --success-bg: rgba(74, 222, 128, 0.12);
+  --warning-dim: #ab8218;
+  --warning-bg: rgba(251, 191, 36, 0.12);
+  --danger-dim: #a94d4d;
+  --danger-bg: rgba(248, 113, 113, 0.12);
+  --info-dim: #4170aa;
+  --info-bg: rgba(96, 165, 250, 0.12);
+
+  --chart-1: #d4a843;
+  --chart-2: #60a5fa;
+  --chart-3: #4ade80;
+  --chart-4: #fbbf24;
+  --chart-5: #f87171;
+  --chart-6: #ac8bb6;
+  --chart-axis: #8d9ab3;
+  --relic-lith: #9ca3af;
+  --relic-meso: #f59e0b;
+  --relic-neo: #60a5fa;
+  --relic-axi: #ef4444;
+  --relic-requiem: #a855f7;
+  --riven-pip: #5ec8ff;
+  --riven-reroll: #f06dff;
+
+  --view-accent: var(--accent);
+  --view-accent-dim: var(--accent-dim);
+  --view-accent-bright: var(--accent-bright);
+  --view-accent-glow: var(--accent-glow);
+
+  --radius-sm: 0.28rem;
+  --radius-md: 0.42rem;
+  --radius-lg: 0.62rem;
+  --radius-xl: 0.78rem;
+  --ui-panel-bg: var(--bg-surface);
+  --ui-modal-bg: var(--bg-surface);
+  --ui-panel-border: var(--border);
+  --ui-panel-shadow: none;
+  --ui-control-bg: var(--bg-raised);
+  --ui-control-border: var(--border);
+  --ui-backdrop-blur: none;
+  --sidebar-width: 300px;
+  --content-gutter: 1.75rem;
+  --titlebar-height: 38px;
+  --statusbar-height: calc(var(--font-global-size, 15px) * 28 / 15);
+  --item-image-max: 96px;
+  --resource-image-wrap: 52px;
+  --resource-image-max: 42px;
+  --detail-image-wrap: 108px;
+  --detail-image-max: 94px;
+  --relic-grid-gap: 0.68rem;
+  --relic-card-icon-size: 2.9rem;
+  --relic-card-min-height: 5.2rem;
+  --relic-card-pad-x: 0.78rem;
+  --font-display: "Rajdhani", sans-serif;
+  --font-body: "Barlow", sans-serif;
+  --size-titlebar-control: 2.875rem;
+  --size-relic-detail-icon: 3.25rem;
+
+  --grade-s: #4ade80;
+  --grade-a: #6aab7a;
+  --grade-b: #facc15;
+  --grade-c: #f97316;
+  --grade-d: #f97316;
+  --grade-f: #ef4444;
+  --grade-default: #8b93a5;
+
+  --rarity-common: #c0a06a;
+  --rarity-uncommon: #b0b8c8;
+  --rarity-rare: #d4a843;
+
+  --world-state-day-text: #fbbf24;
+  --world-state-night-text: #60a5fa;
+  --world-state-warm-text: #f97316;
+  --world-state-cold-text: #38bdf8;
+  --world-state-fass-text: #f97316;
+  --world-state-vome-text: #a78bfa;
+  --world-state-anger-text: #ef4444;
+  --world-state-joy-text: #fbbf24;
+  --world-state-envy-text: #22c55e;
+  --world-state-sorrow-text: #60a5fa;
+  --world-state-fear-text: #a78bfa;
+
+  --world-badge-lith-text: #4ade80;
+  --world-badge-meso-text: #9a9aa0;
+  --world-badge-neo-text: #c0c5d0;
+  --world-badge-axi-text: #fbbf24;
+  --world-badge-requiem-text: #ef4444;
+  --world-badge-omnia-text: #2dd4bf;
+  --world-faction-grineer: #ef5350;
+  --world-faction-corpus: #42a5f5;
+  --world-faction-infested: #66bb6a;
+  --world-timer-urgent-text: #ef4444;
+}

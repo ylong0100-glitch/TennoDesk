@@ -1,0 +1,213 @@
+<script lang="ts">
+  import { locale, tr } from "../../lib/i18n.js";
+  import ThemedInput from "../ThemedInput.svelte";
+  import ThemedPanel from "../ThemedPanel.svelte";
+  import type { TradeEvent } from "../../types/ipc.js";
+  import { formatWfmAssetUrl } from "../../../config/shared/wfm.js";
+
+  export let trades: TradeEvent[] = [];
+
+  type TradeFilter = "all" | "sale" | "purchase" | "trade";
+  let tradeFilter: TradeFilter = "all";
+  let tradeSearch = "";
+  const PAGE_ROWS = 300;
+  let visibleRows = PAGE_ROWS;
+
+  $: filteredTrades = trades.filter((t) => {
+    if (tradeFilter !== "all" && t.type !== tradeFilter) return false;
+    if (tradeSearch) {
+      const q = tradeSearch.toLowerCase();
+      if (
+        !t.items.some((item) => item.displayName.toLowerCase().includes(q)) &&
+        !t.partner?.toLowerCase().includes(q)
+      )
+        return false;
+    }
+    return true;
+  });
+  $: visibleTrades = filteredTrades.slice(0, visibleRows);
+  $: hiddenTrades = filteredTrades.length - visibleTrades.length;
+
+  $: tradeTimeFormat = new Intl.DateTimeFormat($locale, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+
+  function formatTradeDate(iso: string, formatter: Intl.DateTimeFormat): string {
+    const d = new Date(iso);
+    const mo = d.getMonth() + 1;
+    const da = d.getDate();
+    const time = formatter.format(d);
+    return `${mo}/${da}  ${time}`;
+  }
+
+  function thumbUrl(thumb: string | undefined | null): string | null {
+    return formatWfmAssetUrl(thumb);
+  }
+</script>
+
+<div
+  data-stats-trade-panel
+  class="w-[20rem] max-[1100px]:w-[16rem] flex-1 border-l border-[color:var(--ui-panel-border)] flex flex-col min-h-0 overflow-hidden"
+>
+  <div class="px-3 pt-2 shrink-0">
+    <span class="block text-xs font-semibold uppercase tracking-[0.06em] text-text-muted mb-1.5"
+      >{$tr("stats.trades")}</span
+    >
+    <div class="flex flex-col gap-2">
+      <div class="grid grid-cols-2 gap-1" data-trade-filters>
+        {#each ["all", "sale", "purchase", "trade"] as const as f}
+          <button
+            class="flex-1 flex items-center justify-center gap-1 py-1 px-[6px] text-xs border rounded cursor-pointer transition-[background,color,border-color] duration-150 whitespace-nowrap {tradeFilter ===
+            f
+              ? 'bg-accent border-accent text-text-on-accent font-semibold'
+              : 'border-border bg-transparent text-text-muted hover:text-text-primary'}"
+            on:click={() => {
+              tradeFilter = f;
+              visibleRows = PAGE_ROWS;
+            }}
+          >
+            {f === "all"
+              ? $tr("common.all")
+              : f === "sale"
+                ? $tr("stats.filterSale")
+                : f === "purchase"
+                  ? $tr("stats.filterPurchase")
+                  : $tr("stats.filterTrade")}
+            <span
+              class="text-xs rounded-lg px-1 min-w-[16px] text-center {tradeFilter === f
+                ? 'bg-surface-selected'
+                : 'bg-surface-card'}"
+            >
+              {f === "all" ? trades.length : trades.filter((t) => t.type === f).length}
+            </span>
+          </button>
+        {/each}
+      </div>
+      <ThemedInput
+        type="text"
+        placeholder={$tr("stats.tradeSearchPlaceholder")}
+        bind:value={tradeSearch}
+        onInput={() => (visibleRows = PAGE_ROWS)}
+        className="w-full py-1 px-2.5 text-xs"
+        searchFocusTarget
+      />
+    </div>
+  </div>
+
+  <div class="flex-1 overflow-y-auto min-h-0 py-3 px-4" data-stats-trade-list>
+    {#if filteredTrades.length === 0}
+      <div class="flex flex-col items-center justify-center gap-2 py-8 px-4 text-center">
+        {#if trades.length === 0}
+          <p class="text-xs font-semibold text-text-secondary m-0">{$tr("common.noTradesYet")}</p>
+          <p class="text-xs text-text-muted max-w-[26.67rem] leading-relaxed m-0">
+            {$tr("stats.noTradesDesc")}
+          </p>
+        {:else}
+          <p class="text-xs font-semibold text-text-secondary m-0">
+            {$tr("stats.noMatchingTrades")}
+          </p>
+        {/if}
+      </div>
+    {:else}
+      <div class="flex flex-col gap-2">
+        {#each visibleTrades as trade (trade.id)}
+          <ThemedPanel
+            className="py-3 px-4 [content-visibility:auto] [contain-intrinsic-size:auto_110px] transition-[border-color,background] duration-150 hover:border-border-strong hover:bg-bg-raised {trade.wfmClosed
+              ? 'border-accent/20'
+              : ''}"
+          >
+            <div class="flex items-center gap-2 mb-[6px]" data-trade-row={trade.id}>
+              <span
+                class="text-xs py-[2px] px-[6px] rounded-[3px] uppercase tracking-[0.05em] font-bold shrink-0 border {trade.type ===
+                'sale'
+                  ? 'bg-success/15 text-success border-success/30'
+                  : trade.type === 'purchase'
+                    ? 'bg-info/15 text-info border-info/30'
+                    : 'bg-surface-hover text-text-secondary border-border-subtle'}"
+              >
+                {trade.type === "sale"
+                  ? $tr("stats.filterSale")
+                  : trade.type === "purchase"
+                    ? $tr("stats.filterPurchase")
+                    : $tr("stats.filterTrade")}
+              </span>
+              {#if trade.wfmClosed}
+                <span
+                  class="text-xs font-bold uppercase tracking-[0.04em] py-[1px] px-1 rounded-[3px] bg-accent/15 text-accent border border-accent/30 shrink-0"
+                  title={$tr("stats.wfmAutoClosedTitle")}>{$tr("stats.wfmBadge")}</span
+                >
+              {/if}
+              {#if trade.platChange > 0}
+                <span
+                  class="text-sm font-bold tracking-tight shrink-0 {trade.type === 'sale'
+                    ? 'text-success'
+                    : trade.type === 'purchase'
+                      ? 'text-danger'
+                      : 'text-text-secondary'}"
+                >
+                  {trade.type === "sale"
+                    ? "+"
+                    : trade.type === "purchase"
+                      ? "−"
+                      : ""}{trade.platChange}
+                  <span class="text-xs font-normal opacity-80">p</span>
+                </span>
+              {/if}
+              {#if trade.partner}
+                <span
+                  data-trade-partner
+                  class="text-xs text-accent font-semibold whitespace-nowrap overflow-hidden text-ellipsis max-w-[8rem]"
+                  >{trade.partner}</span
+                >
+              {/if}
+              <span class="text-xs text-text-muted ml-auto whitespace-nowrap"
+                >{formatTradeDate(trade.date, tradeTimeFormat)}</span
+              >
+            </div>
+            {#if trade.items.length > 0}
+              <div class="flex flex-wrap gap-1 mt-1">
+                {#each trade.items as item}
+                  <span
+                    class="inline-flex items-center gap-[3px] text-xs text-text-secondary bg-bg-deep rounded-[3px] py-[2px] px-[6px] border max-w-[14.67rem] overflow-hidden text-ellipsis whitespace-nowrap {item.direction ===
+                    'received'
+                      ? 'border-success/15'
+                      : item.direction === 'given'
+                        ? 'border-danger/15'
+                        : 'border-transparent'}"
+                  >
+                    {#if item.wfmThumb}
+                      <img
+                        class="w-4 h-4 object-contain shrink-0 rounded-sm"
+                        src={thumbUrl(item.wfmThumb)}
+                        alt=""
+                      />
+                    {/if}
+                    <span
+                      class="text-xs shrink-0 {item.direction === 'received'
+                        ? 'text-success'
+                        : item.direction === 'given'
+                          ? 'text-danger'
+                          : ''}">{item.direction === "received" ? "↓" : "↑"}</span
+                    >
+                    {item.count > 1 ? `${item.count}×` : ""}{item.displayName}
+                  </span>
+                {/each}
+              </div>
+            {/if}
+          </ThemedPanel>
+        {/each}
+        {#if hiddenTrades > 0}
+          <button
+            type="button"
+            class="btn-secondary btn-sm mt-1 self-center"
+            data-stats-trades-more={hiddenTrades}
+            on:click={() => (visibleRows += PAGE_ROWS)}
+          >
+            {$tr("browse.showMore", { n: hiddenTrades })}
+          </button>
+        {/if}
+      </div>
+    {/if}
+  </div>
+</div>

@@ -1,0 +1,526 @@
+import { OVERLAY_LAYOUT_KINDS, normalizeOverlayLayout } from "../../config/shared/overlayLayout";
+import { normalizeNotificationVolume } from "../../config/shared/notificationSound";
+import { normalizeErrorMessage } from "../../config/shared/errors";
+import { clampNumber } from "../../config/shared/numeric";
+import { normalizeRewardOverlayLayout } from "../../config/shared/rewardOverlayLayout";
+import { normalizeWfmAwayIdleMinutes, normalizeWfmHoldMinutes } from "../../config/shared/wfm";
+import { asRecord } from "../../config/shared/objectValidation";
+import {
+  isScalableOverlayWindow,
+  LEGACY_INTERACTION_HOTKEY,
+  OVERLAY_WINDOW_KEYS,
+  REFERENCE_WARFRAME_UI_SCALE,
+} from "../../config/runtime/overlaySettings";
+import type {
+  OverlaySavedWindowBounds,
+  OverlaySettings,
+  OverlayWindowKey,
+} from "../../config/runtime/overlaySettings";
+
+/** Internal dict for validation before assigning to typed ctx.overlaySettings. */
+type OverlaySettingsDict = Record<string, unknown>;
+
+type Logger = {
+  info: (...args: unknown[]) => void;
+  warn: (...args: unknown[]) => void;
+  error: (...args: unknown[]) => void;
+};
+
+type OverlayCtx = {
+  overlaySettings: OverlaySettings;
+  overlayHotkeyRegistered: string | null;
+  overlayWindow: import("electron").BrowserWindow | null;
+  plannerOverlayWindow?: import("electron").BrowserWindow | null;
+  overlayInteractionHotkeyRegistered: string | null;
+  rivenRescanHotkeyRegistered: string | null;
+  overlayInteractiveMode: boolean;
+};
+
+type OverlayFs = Pick<typeof import("node:fs"), "existsSync" | "readFileSync">;
+
+type OverlaySettingsControllerOptions = {
+  log: Logger;
+  fs: OverlayFs;
+  writeFileAtomic: (filePath: string, data: string) => void;
+  // Minimal shape so keyHookShortcut can stand in for Electron's globalShortcut.
+  globalShortcut: {
+    register: (accelerator: string, callback: () => void) => boolean;
+    unregister: (accelerator: string) => void;
+  };
+  ctx: OverlayCtx;
+  settingsFile: string;
+  defaults: OverlaySettingsDict;
+  onRelicRewardTrigger: (source?: string) => void;
+  onToggleOverlayInteractionMode: (source?: string) => void;
+  onRivenRescanTrigger: (source?: string) => void;
+  configureWarframeLifecycle: (enabled: boolean) => Promise<void>;
+};
+
+function normalizeHotkey(value: unknown, fallbackHotkey: string): string {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) return fallbackHotkey;
+  if (!raw.includes("+")) return raw.toUpperCase();
+  const normalized = raw
+    .split("+")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const low = part.toLowerCase();
+      if (low === "commandorcontrol") return "CommandOrControl";
+      if (low === "command") return "Command";
+      if (low === "control" || low === "ctrl") return "Control";
+      if (low === "alt") return "Alt";
+      if (low === "option") return "Option";
+      if (low === "shift") return "Shift";
+      if (low === "super") return "Super";
+      return part.length === 1 ? part.toUpperCase() : part[0].toUpperCase() + part.slice(1);
+    })
+    .join("+");
+
+  const parts = normalized
+    .split("+")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const modifiers = new Set([
+    "CommandOrControl",
+    "Command",
+    "Control",
+    "Alt",
+    "Option",
+    "Shift",
+    "Super",
+  ]);
+  const hasNonModifierKey = parts.some((part) => !modifiers.has(part));
+  return hasNonModifierKey ? normalized : fallbackHotkey;
+}
+
+export function createOverlaySettingsController(options: OverlaySettingsControllerOptions) {
+  const {
+    log,
+    fs,
+    writeFileAtomic,
+    globalShortcut,
+    ctx,
+    settingsFile,
+    defaults,
+    onRelicRewardTrigger,
+    onToggleOverlayInteractionMode,
+    onRivenRescanTrigger,
+  } = options;
+
+  function normalizeFissureAlerts(
+    value: unknown,
+    fallback: unknown,
+  ): Array<{ id: string; tier: string; missionType: string; steelPath: string; planet: string }> {
+    const arr = Array.isArray(value) ? value : Array.isArray(fallback) ? fallback : [];
+    return arr
+      .map(asRecord)
+      .filter((r): r is Record<string, unknown> => r !== null)
+      .map((r) => {
+        return {
+          id: typeof r.id === "string" && r.id ? r.id : Math.random().toString(36).slice(2, 10),
+          tier: typeof r.tier === "string" ? r.tier : "any",
+          missionType: typeof r.missionType === "string" ? r.missionType : "any",
+          steelPath:
+            r.steelPath === "normal" || r.steelPath === "steel" ? (r.steelPath as string) : "any",
+          planet: typeof r.planet === "string" ? r.planet : "any",
+        };
+      });
+  }
+
+  function normalizeCycleAlerts(
+    value: unknown,
+    fallback: unknown,
+  ): { earth: boolean; cetus: boolean; vallis: boolean; cambion: boolean; duviri: boolean } {
+    const def = asRecord(fallback) ?? {};
+    const v = asRecord(value) ?? {};
+    return {
+      earth: v.earth !== undefined ? !!v.earth : !!def.earth,
+      cetus: v.cetus !== undefined ? !!v.cetus : !!def.cetus,
+      vallis: v.vallis !== undefined ? !!v.vallis : !!def.vallis,
+      cambion: v.cambion !== undefined ? !!v.cambion : !!def.cambion,
+      duviri: v.duviri !== undefined ? !!v.duviri : !!def.duviri,
+    };
+  }
+
+  function normalizeNotificationSeconds(value: unknown, fallback: unknown): number {
+    return Math.round(clampNumber(value, 2, 60, Number(fallback ?? 5)));
+  }
+
+  function normalizeOverlayScale(value: unknown, fallback: unknown): number {
+    return Number(clampNumber(value, 0.75, 1.5, Number(fallback ?? 1)).toFixed(2));
+  }
+
+  function normalizeWarframeUiScale(value: unknown, fallback: unknown): number {
+    return Number(
+      clampNumber(value, 0.5, 1, Number(fallback ?? REFERENCE_WARFRAME_UI_SCALE)).toFixed(2),
+    );
+  }
+
+  function normalizeWindowScales(value: unknown): Partial<Record<OverlayWindowKey, number>> {
+    const input = asRecord(value);
+    if (!input) return {};
+    const out: Partial<Record<OverlayWindowKey, number>> = {};
+    for (const key of OVERLAY_WINDOW_KEYS.filter(isScalableOverlayWindow)) {
+      const scale = clampNumber(input[key], 0.75, 1.5, NaN);
+      if (Number.isFinite(scale)) out[key] = Number(scale.toFixed(3));
+    }
+    return out;
+  }
+
+  function normalizeSavedBounds(
+    value: unknown,
+  ): Partial<Record<OverlayWindowKey, OverlaySavedWindowBounds>> {
+    const input = asRecord(value);
+    if (!input) return {};
+    const out: Partial<Record<OverlayWindowKey, OverlaySavedWindowBounds>> = {};
+    for (const key of OVERLAY_WINDOW_KEYS) {
+      const record = asRecord(input[key]);
+      if (!record) continue;
+      const x = Math.round(clampNumber(record.x, -20000, 20000, NaN));
+      const y = Math.round(clampNumber(record.y, -20000, 20000, NaN));
+      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+      const displayId =
+        typeof record.displayId === "string" && record.displayId.trim()
+          ? record.displayId.trim()
+          : null;
+      out[key] = displayId ? { x, y, displayId } : { x, y };
+      const width = clampNumber(record.width, 24, 20000, NaN);
+      const height = clampNumber(record.height, 24, 20000, NaN);
+      if (Number.isFinite(width) && Number.isFinite(height)) {
+        out[key].width = width;
+        out[key].height = height;
+      }
+    }
+    return out;
+  }
+
+  function normalizeOverlaySettings(raw: unknown): OverlaySettingsDict {
+    const candidate = asRecord(raw) ?? {};
+    const booleanSetting = (key: keyof OverlaySettings): boolean =>
+      candidate[key] !== undefined ? !!candidate[key] : !!defaults[key];
+    const tradeNotificationOverlayEnabled =
+      candidate.tradeNotificationOverlayEnabled !== undefined
+        ? !!candidate.tradeNotificationOverlayEnabled
+        : candidate.showTradeNotification !== undefined
+          ? !!candidate.showTradeNotification
+          : !!defaults.tradeNotificationOverlayEnabled;
+
+    return {
+      autoTriggerEnabled: booleanSetting("autoTriggerEnabled"),
+      hotkeyEnabled: booleanSetting("hotkeyEnabled"),
+      hotkey: normalizeHotkey(candidate.hotkey ?? defaults.hotkey, String(defaults.hotkey)),
+      interactionHotkeyEnabled: booleanSetting("interactionHotkeyEnabled"),
+      // Migrate the retired Control+Tab default (global grab that steals the
+      // browser tab-switch key) onto the current default.
+      interactionHotkey: normalizeHotkey(
+        candidate.interactionHotkey === LEGACY_INTERACTION_HOTKEY
+          ? defaults.interactionHotkey
+          : (candidate.interactionHotkey ?? defaults.interactionHotkey),
+        String(defaults.interactionHotkey),
+      ),
+      rivenRescanHotkeyEnabled: booleanSetting("rivenRescanHotkeyEnabled"),
+      rivenRescanHotkey: normalizeHotkey(
+        candidate.rivenRescanHotkey ?? defaults.rivenRescanHotkey,
+        String(defaults.rivenRescanHotkey),
+      ),
+      worldNotificationsEnabled: booleanSetting("worldNotificationsEnabled"),
+      cycleAlerts: normalizeCycleAlerts(candidate.cycleAlerts, defaults.cycleAlerts),
+      cycleAlertMinutesBefore: Math.floor(
+        clampNumber(
+          candidate.cycleAlertMinutesBefore,
+          0,
+          120,
+          Number((defaults as Record<string, unknown>).cycleAlertMinutesBefore ?? 3),
+        ),
+      ),
+      fissureAlerts: normalizeFissureAlerts(candidate.fissureAlerts, defaults.fissureAlerts),
+      notificationSoundEnabled: booleanSetting("notificationSoundEnabled"),
+      notificationSoundVolume: normalizeNotificationVolume(
+        candidate.notificationSoundVolume ?? defaults.notificationSoundVolume,
+      ),
+      notificationSoundUsesSystem: booleanSetting("notificationSoundUsesSystem"),
+      wfmNotificationsEnabled: booleanSetting("wfmNotificationsEnabled"),
+      messageNotificationsEnabled: booleanSetting("messageNotificationsEnabled"),
+      messageNotificationsWhileFocused: booleanSetting("messageNotificationsWhileFocused"),
+      autoCloseWfmOrders: booleanSetting("autoCloseWfmOrders"),
+      wfmAutoIngameEnabled: booleanSetting("wfmAutoIngameEnabled"),
+      tradeNotificationSeconds: normalizeNotificationSeconds(
+        candidate.tradeNotificationSeconds,
+        Number((defaults as Record<string, unknown>).tradeNotificationSeconds ?? 5),
+      ),
+      tradeDesktopNotificationsEnabled: booleanSetting("tradeDesktopNotificationsEnabled"),
+      windowsNotificationSeconds: normalizeNotificationSeconds(
+        candidate.windowsNotificationSeconds,
+        Number((defaults as Record<string, unknown>).windowsNotificationSeconds ?? 5),
+      ),
+      wfmStatusHoldMinutes: normalizeWfmHoldMinutes(
+        candidate.wfmStatusHoldMinutes,
+        Number((defaults as Record<string, unknown>).wfmStatusHoldMinutes ?? 0),
+      ),
+      wfmAwayIdleEnabled: booleanSetting("wfmAwayIdleEnabled"),
+      wfmAwayIdleMinutes: normalizeWfmAwayIdleMinutes(
+        candidate.wfmAwayIdleMinutes,
+        normalizeWfmAwayIdleMinutes((defaults as Record<string, unknown>).wfmAwayIdleMinutes),
+      ),
+      wfmAwayWhenClosedEnabled: booleanSetting("wfmAwayWhenClosedEnabled"),
+      tradeRepHotkeyEnabled: booleanSetting("tradeRepHotkeyEnabled"),
+      tradeRepHotkey: normalizeHotkey(
+        candidate.tradeRepHotkey ?? defaults.tradeRepHotkey,
+        String(defaults.tradeRepHotkey),
+      ),
+      relicRewardsOverlayEnabled: booleanSetting("relicRewardsOverlayEnabled"),
+      relicRecommendationOverlayEnabled: booleanSetting("relicRecommendationOverlayEnabled"),
+      tradeNotificationOverlayEnabled,
+      rivenOverlayEnabled: booleanSetting("rivenOverlayEnabled"),
+      arbiSummaryOverlayEnabled: booleanSetting("arbiSummaryOverlayEnabled"),
+      arbiTrackingEnabled: booleanSetting("arbiTrackingEnabled"),
+      missionTrackingEnabled: booleanSetting("missionTrackingEnabled"),
+      autoInventorySyncEnabled: booleanSetting("autoInventorySyncEnabled"),
+      ocrDebugImagesEnabled: booleanSetting("ocrDebugImagesEnabled"),
+      blockThirdPartyInjection: booleanSetting("blockThirdPartyInjection"),
+      keepRunningOnClose: booleanSetting("keepRunningOnClose"),
+      warframeLifecycleEnabled: booleanSetting("warframeLifecycleEnabled"),
+      warframeUiScale: normalizeWarframeUiScale(
+        candidate.warframeUiScale,
+        defaults.warframeUiScale,
+      ),
+      warframeUiScaleAuto: booleanSetting("warframeUiScaleAuto"),
+      uiScale: normalizeOverlayScale(candidate.uiScale, defaults.uiScale),
+      overlayScale: normalizeOverlayScale(candidate.overlayScale, defaults.overlayScale),
+      overlayWindowScales: normalizeWindowScales(candidate.overlayWindowScales),
+      overlayWindowBounds: normalizeSavedBounds(candidate.overlayWindowBounds),
+      rewardLayout: normalizeRewardOverlayLayout(candidate.rewardLayout),
+      overlayLayouts: Object.fromEntries(
+        OVERLAY_LAYOUT_KINDS.filter((kind) => kind !== "reward").map((kind) => [
+          kind,
+          normalizeOverlayLayout(kind, asRecord(candidate.overlayLayouts)?.[kind]),
+        ]),
+      ),
+      overlayDragHintDismissed: booleanSetting("overlayDragHintDismissed"),
+      linuxOverlaysInteractive: booleanSetting("linuxOverlaysInteractive"),
+      rivenSimilarAuctionsShown: booleanSetting("rivenSimilarAuctionsShown"),
+    };
+  }
+
+  function loadOverlaySettings(): OverlaySettings {
+    try {
+      if (fs.existsSync(settingsFile)) {
+        const raw = fs.readFileSync(settingsFile, "utf8");
+        const parsed = JSON.parse(raw);
+        ctx.overlaySettings = normalizeOverlaySettings({
+          ...defaults,
+          ...parsed,
+        }) as OverlaySettings;
+      } else {
+        ctx.overlaySettings = { ...defaults } as OverlaySettings;
+      }
+    } catch (err) {
+      log.warn(
+        "[OverlaySettings] Failed to load settings, using defaults:",
+        normalizeErrorMessage(err),
+      );
+      ctx.overlaySettings = { ...defaults } as OverlaySettings;
+    }
+    return ctx.overlaySettings;
+  }
+
+  function saveOverlaySettings(): boolean {
+    try {
+      writeFileAtomic(settingsFile, JSON.stringify(ctx.overlaySettings, null, 2));
+      return true;
+    } catch (err) {
+      log.error("[OverlaySettings] Failed to save settings:", normalizeErrorMessage(err));
+      return false;
+    }
+  }
+
+  function unregisterOverlayTriggerHotkey(): void {
+    if (!ctx.overlayHotkeyRegistered) return;
+    try {
+      globalShortcut.unregister(ctx.overlayHotkeyRegistered);
+    } catch (err) {
+      log.warn("[OverlayHotkey] unregister failed:", normalizeErrorMessage(err));
+    }
+    ctx.overlayHotkeyRegistered = null;
+  }
+
+  function unregisterOverlayInteractionHotkey(): void {
+    if (!ctx.overlayInteractionHotkeyRegistered) return;
+    try {
+      globalShortcut.unregister(ctx.overlayInteractionHotkeyRegistered);
+    } catch (err) {
+      log.warn("[OverlayInteractionHotkey] unregister failed:", normalizeErrorMessage(err));
+    }
+    ctx.overlayInteractionHotkeyRegistered = null;
+  }
+
+  function unregisterRivenRescanHotkey(): void {
+    if (!ctx.rivenRescanHotkeyRegistered) return;
+    try {
+      globalShortcut.unregister(ctx.rivenRescanHotkeyRegistered);
+    } catch (err) {
+      log.warn("[RivenRescanHotkey] unregister failed:", normalizeErrorMessage(err));
+    }
+    ctx.rivenRescanHotkeyRegistered = null;
+  }
+
+  function unregisterOverlayHotkey(): void {
+    unregisterOverlayTriggerHotkey();
+    unregisterOverlayInteractionHotkey();
+    unregisterRivenRescanHotkey();
+  }
+
+  function registerOverlayTriggerHotkey(): boolean {
+    unregisterOverlayTriggerHotkey();
+
+    if (!ctx.overlaySettings.hotkeyEnabled) {
+      log.info("[OverlayHotkey] disabled");
+      return false;
+    }
+
+    const accelerator = String(ctx.overlaySettings.hotkey || "");
+    if (!accelerator) return false;
+
+    try {
+      const ok = globalShortcut.register(accelerator, () => onRelicRewardTrigger("hotkey"));
+      if (!ok) {
+        log.warn("[OverlayHotkey] register failed:", accelerator);
+        return false;
+      }
+      ctx.overlayHotkeyRegistered = accelerator;
+      log.info("[OverlayHotkey] registered:", accelerator);
+      return true;
+    } catch (err) {
+      log.warn("[OverlayHotkey] invalid shortcut:", accelerator, normalizeErrorMessage(err));
+      return false;
+    }
+  }
+
+  function registerOverlayInteractionHotkey(): boolean {
+    unregisterOverlayInteractionHotkey();
+
+    if (!ctx.overlaySettings.interactionHotkeyEnabled) {
+      log.info("[OverlayInteractionHotkey] disabled");
+      return false;
+    }
+
+    const accelerator = String(ctx.overlaySettings.interactionHotkey || "");
+    if (!accelerator) return false;
+
+    try {
+      const ok = globalShortcut.register(accelerator, () => {
+        onToggleOverlayInteractionMode("hotkey");
+      });
+      if (!ok) {
+        log.warn("[OverlayInteractionHotkey] register failed:", accelerator);
+        return false;
+      }
+      ctx.overlayInteractionHotkeyRegistered = accelerator;
+      log.info("[OverlayInteractionHotkey] registered:", accelerator);
+      return true;
+    } catch (err) {
+      log.warn(
+        "[OverlayInteractionHotkey] invalid shortcut:",
+        accelerator,
+        normalizeErrorMessage(err),
+      );
+      return false;
+    }
+  }
+
+  function registerRivenRescanHotkey(): boolean {
+    unregisterRivenRescanHotkey();
+
+    if (!ctx.overlaySettings.rivenRescanHotkeyEnabled) {
+      log.info("[RivenRescanHotkey] disabled");
+      return false;
+    }
+
+    const accelerator = String(ctx.overlaySettings.rivenRescanHotkey || "");
+    if (!accelerator) return false;
+
+    try {
+      const ok = globalShortcut.register(accelerator, () => onRivenRescanTrigger("hotkey"));
+      if (!ok) {
+        log.warn("[RivenRescanHotkey] register failed:", accelerator);
+        return false;
+      }
+      ctx.rivenRescanHotkeyRegistered = accelerator;
+      log.info("[RivenRescanHotkey] registered:", accelerator);
+      return true;
+    } catch (err) {
+      log.warn("[RivenRescanHotkey] invalid shortcut:", accelerator, normalizeErrorMessage(err));
+      return false;
+    }
+  }
+
+  // Hotkeys are only held while Warframe runs; main drives this via setHotkeysActive.
+  let hotkeysActive = false;
+
+  function registerOverlayHotkey(): boolean {
+    if (!hotkeysActive) {
+      unregisterOverlayHotkey();
+      return false;
+    }
+    const triggerOk = registerOverlayTriggerHotkey();
+    const interactionOk = registerOverlayInteractionHotkey();
+    const rescanOk = registerRivenRescanHotkey();
+    return triggerOk || interactionOk || rescanOk;
+  }
+
+  function setHotkeysActive(active: boolean): void {
+    if (hotkeysActive === active) return;
+    hotkeysActive = active;
+    if (active) registerOverlayHotkey();
+    else unregisterOverlayHotkey();
+  }
+
+  function setOverlaySettings(nextSettings: unknown): OverlaySettings {
+    const previous = ctx.overlaySettings;
+    ctx.overlaySettings = normalizeOverlaySettings({
+      ...ctx.overlaySettings,
+      ...(asRecord(nextSettings) ?? {}),
+    }) as OverlaySettings;
+
+    if (!saveOverlaySettings()) {
+      ctx.overlaySettings = previous;
+      throw new Error("Could not save overlay settings");
+    }
+    return { ...ctx.overlaySettings };
+  }
+
+  let settingsUpdate: Promise<unknown> = Promise.resolve();
+
+  function setOverlaySettingsWithLifecycle(
+    nextSettings: unknown,
+    beforeSave?: () => void,
+  ): Promise<OverlaySettings> {
+    const update = settingsUpdate.then(async () => {
+      const nextEnabled = asRecord(nextSettings)?.warframeLifecycleEnabled;
+      const previousEnabled = ctx.overlaySettings.warframeLifecycleEnabled === true;
+      const lifecycleChanged = typeof nextEnabled === "boolean" && nextEnabled !== previousEnabled;
+      if (lifecycleChanged) await options.configureWarframeLifecycle(nextEnabled);
+      try {
+        beforeSave?.();
+        return setOverlaySettings(nextSettings);
+      } catch (error) {
+        if (lifecycleChanged) await options.configureWarframeLifecycle(previousEnabled);
+        throw error;
+      }
+    });
+    settingsUpdate = update.catch(() => undefined);
+    return update;
+  }
+
+  return {
+    normalizeOverlaySettings,
+    loadOverlaySettings,
+    saveOverlaySettings,
+    unregisterOverlayHotkey,
+    registerOverlayHotkey,
+    setHotkeysActive,
+    setOverlaySettings,
+    setOverlaySettingsWithLifecycle,
+  };
+}

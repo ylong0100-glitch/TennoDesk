@@ -1,0 +1,13 @@
+<script lang="ts">
+  export let value: string | number;
+  export let disabled = false;
+  export let className = "";
+</script>
+
+<select
+  bind:value
+  {disabled}
+  class="h-6 leading-none cursor-pointer rounded-[var(--radius-md)] border border-[color:var(--ui-control-border)] bg-bg-surface px-1.5 py-0 text-xs text-text-primary disabled:cursor-not-allowed disabled:opacity-50 [&_option]:bg-bg-surface [&_option]:text-text-primary {className}"
+>
+  <slot />
+</select>

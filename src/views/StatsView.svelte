@@ -1,0 +1,1003 @@
+<script context="module" lang="ts">
+  import { registerSections } from "../lib/layout/registry.js";
+
+  /** The scrolling left column; the trade rail is placed on its own. */
+  const STATS_MAIN_SECTIONS = ["stats.summary", "stats.charts"];
+
+  registerSections("stats", [
+    {
+      id: "stats.summary",
+      view: "stats",
+      labelKey: "layout.section.statsSummary",
+      defaultSpan: "full",
+      canCollapse: true,
+    },
+    {
+      id: "stats.charts",
+      view: "stats",
+      labelKey: "layout.section.statsCharts",
+      defaultSpan: "full",
+      canCollapse: true,
+      canPopout: true,
+    },
+    {
+      id: "stats.trades",
+      view: "stats",
+      labelKey: "stats.trades",
+      defaultSpan: "full",
+    },
+  ]);
+</script>
+
+<script lang="ts">
+  import { onMount, onDestroy } from "svelte";
+  import { invoke, on } from "../lib/ipc.js";
+  import { pageLedgerRange } from "../lib/stats/ledgerPaging.js";
+  import EditLayoutBar from "../components/layout/EditLayoutBar.svelte";
+  import LayoutGrid from "../components/layout/LayoutGrid.svelte";
+  import LayoutSection from "../components/layout/LayoutSection.svelte";
+  import { layoutBreakpoint, layoutState, sectionsOf } from "../stores/layout.js";
+  import { locale, tr } from "../lib/i18n.js";
+  import type { DailyStatEntry, SessionStats, TradeEvent } from "../types/ipc.js";
+  import type { MessageKey, Translator } from "../lib/i18n.js";
+  import ModalShell from "../components/ModalShell.svelte";
+  import ThemedButton from "../components/ThemedButton.svelte";
+  import ThemedPanel from "../components/ThemedPanel.svelte";
+  import ThemedSelect from "../components/ThemedSelect.svelte";
+  import SummaryStrip, { type SummaryStripItem } from "../components/SummaryStrip.svelte";
+  import StatsTradePanel from "../components/stats/StatsTradePanel.svelte";
+  import HeaderTabs from "../components/HeaderTabs.svelte";
+  import PersonalStatsPanel from "../components/stats/PersonalStatsPanel.svelte";
+  import { persistedString } from "../lib/persistence.js";
+  import StatResourcePicker from "../components/stats/StatResourcePicker.svelte";
+  import { buildStatIconMap } from "../lib/assetUrls.js";
+  import { itemDb } from "../stores/data.js";
+  import { assertStatsImportFileSize } from "../../config/shared/statsImport.js";
+  import { readStatResourceDay, STAT_RESOURCES } from "../../config/shared/statsTypes.js";
+  import { chartResources, statResourceLabelKey } from "../stores/statsDisplay.js";
+  import {
+    normalizeAlecaFrameStats,
+    parseAlecaFrameTrades,
+  } from "../lib/stats/importAlecaFrame.js";
+  import {
+    type ChartKey,
+    type SessionStatKey,
+    type ChartResult,
+    BAR_H,
+    BAR_H_EXPAND,
+    SVG_W,
+    TIMEFRAME_OPTIONS,
+    formatDelta,
+    formatters,
+    formatAbsolute,
+    shortDate,
+    barsForKey,
+    labelStep,
+  } from "../lib/stats/chartData.js";
+
+  const statsTab = persistedString("stats-tab", ["tracking", "personal"] as const, "tracking");
+  $: statsTabs = [
+    { key: "tracking", label: $tr("profile.tracking") },
+    { key: "personal", label: $tr("profile.personal") },
+  ];
+
+  let trackingMounted = false;
+  $: if ($statsTab === "tracking") trackingMounted = true;
+
+  let session: SessionStats | null = null;
+  let history: DailyStatEntry[] = [];
+  let trades: TradeEvent[] = [];
+  let loading = true;
+  let importStatus = "";
+  let importError = false;
+  let destroyed = false;
+
+  let unsubInventory: (() => void) | null = null;
+  let unsubTrade: (() => void) | null = null;
+
+  async function refreshStats(): Promise<void> {
+    try {
+      const [nextSession, nextHistory] = await Promise.all([
+        invoke("getStatsCurrentSession"),
+        invoke("getStatsHistory"),
+      ]);
+      if (destroyed) return;
+      session = nextSession;
+      history = nextHistory;
+    } catch {
+      // silently ignore - stats tracker may not have data yet
+    }
+  }
+
+  // Older trades live in archives once the live log reaches 2000 rows.
+  const TRADE_LIST_MAX_ROWS = 50_000;
+  let tradeLoad = 0;
+  let tradesDuringLoad: TradeEvent[] | null = null;
+
+  async function refreshTrades(): Promise<void> {
+    const load = ++tradeLoad;
+    const liveUpdates: TradeEvent[] = [];
+    tradesDuringLoad = liveUpdates;
+    try {
+      const page = await pageLedgerRange(
+        {},
+        TRADE_LIST_MAX_ROWS,
+        () => !destroyed && load === tradeLoad,
+      );
+      if (!page) return;
+      const byId = new Map([...page.events, ...liveUpdates].map((trade) => [trade.id, trade]));
+      trades = [...byId.values()]
+        .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0))
+        .slice(0, TRADE_LIST_MAX_ROWS);
+    } catch {
+      // trade history is optional until the tracker has data
+    } finally {
+      if (load === tradeLoad) tradesDuringLoad = null;
+    }
+  }
+
+  onMount(async () => {
+    unsubInventory = on("inventory-updated", () => {
+      void refreshStats();
+    });
+
+    unsubTrade = on("trade-recorded", (data) => {
+      if (data?.trade) {
+        tradesDuringLoad?.push(data.trade);
+        const idx = trades.findIndex((t) => t.id === data.trade.id);
+        if (idx >= 0) {
+          trades = [...trades.slice(0, idx), data.trade, ...trades.slice(idx + 1)];
+        } else {
+          trades = [data.trade, ...trades];
+        }
+      }
+    });
+
+    await Promise.all([refreshStats(), refreshTrades()]);
+    if (!destroyed) {
+      loading = false;
+    }
+  });
+
+  onDestroy(() => {
+    destroyed = true;
+    unsubInventory?.();
+    unsubTrade?.();
+  });
+
+  async function handleImportFile(e: Event): Promise<void> {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    input.value = "";
+
+    importStatus = $tr("stats.importReading");
+    importError = false;
+
+    try {
+      assertStatsImportFileSize(file.size);
+      const text = await file.text();
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        importStatus = $tr("stats.invalidJsonFile");
+        importError = true;
+        return;
+      }
+
+      const normalized = normalizeAlecaFrameStats(parsed);
+      if (normalized.length === 0) {
+        importStatus = $tr("stats.noValidEntries");
+        importError = true;
+        return;
+      }
+
+      const result = await invoke("importStatsHistory", normalized);
+      let statMsg = "";
+      if (result.ok) {
+        if (result.count === 0) {
+          statMsg = $tr("stats.noNewEntries");
+        } else {
+          statMsg =
+            result.count === 1
+              ? $tr("stats.importedDay", { count: result.count })
+              : $tr("stats.importedDays", { count: result.count });
+          history = await invoke("getStatsHistory");
+        }
+      } else {
+        importStatus = $tr("stats.statsImportFailed");
+        importError = true;
+        return;
+      }
+
+      const importedTrades = parseAlecaFrameTrades(parsed);
+      let tradeMsg = "";
+      if (importedTrades.length > 0) {
+        const tradeResult = await invoke("importTradeLog", importedTrades);
+        if (tradeResult.ok && tradeResult.count > 0) {
+          tradeMsg = ` ${
+            tradeResult.count === 1
+              ? $tr("stats.importedTradeSingular", { count: tradeResult.count })
+              : $tr("stats.importedTradePlural", { count: tradeResult.count })
+          }`;
+          await refreshTrades();
+        }
+      }
+
+      importStatus = statMsg + tradeMsg;
+      importError = false;
+    } catch (err: unknown) {
+      importStatus = err instanceof Error ? err.message : $tr("stats.importFailedGeneric");
+      importError = true;
+    }
+  }
+
+  function handleSaveStats(): void {
+    const exportedAt = new Date();
+    const payload = {
+      exportedAt: exportedAt.toISOString(),
+      currentSession: session,
+      history,
+      trades,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    const datePart = exportedAt.toISOString().slice(0, 10);
+    link.href = url;
+    link.download = `wfhelper-stats-${datePart}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  interface ChartSection {
+    /** A resource id, or one of the two non-resource chart keys. */
+    key: string;
+    labelKey: MessageKey;
+  }
+
+  // Session totals for the six pre-map resources keep reading their own fields;
+  // anything else comes from the session resource map.
+  const LEGACY_SESSION_FIELDS: Record<
+    string,
+    {
+      delta: SessionStatKey;
+      current:
+        | "currentPlat"
+        | "currentCredits"
+        | "currentEndo"
+        | "currentDucats"
+        | "currentAya"
+        | "currentVitus";
+    }
+  > = {
+    plat: { delta: "platDelta", current: "currentPlat" },
+    ducats: { delta: "ducatsDelta", current: "currentDucats" },
+    aya: { delta: "ayaDelta", current: "currentAya" },
+    credits: { delta: "creditsDelta", current: "currentCredits" },
+    endo: { delta: "endoDelta", current: "currentEndo" },
+    vitus: { delta: "vitusDelta", current: "currentVitus" },
+  };
+
+  const NON_RESOURCE_SECTIONS: ChartSection[] = [
+    { key: "relicsOpened", labelKey: "stats.relicsOpened" },
+    { key: "dailyTrades", labelKey: "stats.dailyTrades" },
+  ];
+
+  const RESOURCE_IDS = new Set(STAT_RESOURCES.map((r) => r.id));
+
+  // Item-database art fills in behind the bundled icons, so it repaints when the
+  // catalog arrives after the tab is already open.
+  $: iconMap = buildStatIconMap($itemDb);
+
+  type ValueFormatter = (abs: number, locale: string) => string;
+
+  // The six pre-map charts keep their exact formatter; new resources pick the
+  // plain or the k/M one from the catalog.
+  const FORMATTER_BY_KEY: Record<string, ValueFormatter> = {
+    plat: formatters.platDelta,
+    ducats: formatters.ducatsDelta,
+    aya: formatters.ayaDelta,
+    credits: formatters.creditsDelta,
+    endo: formatters.endoDelta,
+    vitus: formatters.vitusDelta,
+    relicsOpened: formatters.relicsOpened,
+    dailyTrades: formatters.dailyTrades,
+  };
+  for (const resource of STAT_RESOURCES) {
+    if (FORMATTER_BY_KEY[resource.id]) continue;
+    FORMATTER_BY_KEY[resource.id] =
+      resource.format === "compact" ? formatters.creditsDelta : formatters.ayaDelta;
+  }
+
+  function formatterFor(key: string): ValueFormatter {
+    return FORMATTER_BY_KEY[key] ?? formatters.relicsOpened;
+  }
+
+  let chartDays = 30;
+  let showResourcePicker = false;
+
+  /** Projects a resource onto the plat slot so barsForKey can chart any id.
+   *  The plat chart reads date, platDelta and absPlat only, so the row is built
+   *  from those: copying every entry and deleting absPlat cost one rebuilt
+   *  object per day per charted resource. */
+  function projectResource(hist: DailyStatEntry[], id: string): DailyStatEntry[] {
+    return hist.map((entry) => {
+      const day = readStatResourceDay(entry, id);
+      return {
+        date: entry.date,
+        platDelta: day?.delta ?? 0,
+        creditsDelta: 0,
+        endoDelta: 0,
+        ducatsDelta: 0,
+        ayaDelta: 0,
+        vitusDelta: 0,
+        relicsOpened: 0,
+        daysPlayed: entry.daysPlayed,
+        dailyTrades: 0,
+        ...(day?.abs === undefined ? {} : { absPlat: day.abs }),
+      };
+    });
+  }
+
+  function chartDataFor(
+    key: string,
+    hist: DailyStatEntry[],
+    daysArg: number,
+    barH: number,
+    localeCode: string,
+    visibility: { showValue: boolean; showChange: boolean },
+  ): ChartResult {
+    if (RESOURCE_IDS.has(key)) {
+      return barsForKey(
+        "platDelta",
+        projectResource(hist, key),
+        daysArg,
+        barH,
+        localeCode,
+        visibility,
+      );
+    }
+    return barsForKey(key as ChartKey, hist, daysArg, barH, localeCode, visibility);
+  }
+
+  function computeChartDataMap(
+    sections: ChartSection[],
+    historyArg: typeof history,
+    daysArg: number,
+    localeCode: string,
+    visibility: { showValue: boolean; showChange: boolean },
+  ): Record<string, ChartResult> {
+    const m: Record<string, ChartResult> = {};
+    for (const { key } of sections) {
+      m[key] = chartDataFor(key, historyArg, daysArg, BAR_H, localeCode, visibility);
+    }
+    return m;
+  }
+
+  function sessionDelta(s: SessionStats, id: string): number {
+    const legacy = LEGACY_SESSION_FIELDS[id];
+    if (legacy) return s[legacy.delta];
+    const entry = s.resources[id];
+    return entry ? entry.delta : 0;
+  }
+
+  function sessionCurrent(s: SessionStats, id: string): number | null {
+    const legacy = LEGACY_SESSION_FIELDS[id];
+    if (legacy) return s[legacy.current];
+    const entry = s.resources[id];
+    return entry ? entry.current : null;
+  }
+
+  function buildSessionItems(
+    s: SessionStats | null,
+    sections: ChartSection[],
+    t: Translator,
+    localeCode: string,
+    icons: Record<string, string>,
+  ): SummaryStripItem[] {
+    if (!s?.hasData) return [];
+    return sections.map(({ key, labelKey }) => ({
+      key,
+      label: t(labelKey),
+      value: formatAbsolute(sessionCurrent(s, key) ?? 0, localeCode),
+      icon: icons[key] ?? null,
+      subtext: `${formatDelta(sessionDelta(s, key), formatterFor(key), localeCode)} ${t("stats.today")}`,
+    }));
+  }
+
+  $: displayedResources = STAT_RESOURCES.filter((r) => $chartResources.includes(r.id)).map(
+    (r): ChartSection => ({ key: r.id, labelKey: statResourceLabelKey(r.id) }),
+  );
+  $: chartSections = [...displayedResources, ...NON_RESOURCE_SECTIONS];
+  $: chartDataMap = computeChartDataMap(chartSections, history, chartDays, $locale, {
+    showValue,
+    showChange,
+  });
+
+  function chartIsEmpty(cd: ChartResult): boolean {
+    return (
+      cd.bars.every((b) => b.value === 0) &&
+      (!cd.hasAbsData || cd.absValues.every((v) => !v || Number.isNaN(v)))
+    );
+  }
+
+  // Expanded modal chart data - recomputes when expandedKey or chartDays changes
+  $: expandedChartData = expandedKey
+    ? chartDataFor(expandedKey, history, chartDays, BAR_H_EXPAND, $locale, {
+        showValue,
+        showChange,
+      })
+    : null;
+  $: sessionSummaryItems = buildSessionItems(session, displayedResources, $tr, $locale, iconMap);
+  // Deselecting the expanded resource leaves the modal without a chart to page to.
+  $: if (expandedKey !== null && !chartSections.some((s) => s.key === expandedKey)) {
+    expandedKey = null;
+  }
+
+  let tooltip: { text: string; x: number; y: number } | null = null;
+
+  function dotLabel(key: string, bar: ChartResult["bars"][number], absVal: number): string {
+    const fmt = formatterFor(key);
+    let text = shortDate(bar.date, $locale);
+    if (!RESOURCE_IDS.has(key)) return `${text} | ${fmt(bar.value, $locale)}`;
+    if (!Number.isNaN(absVal)) text += ` | ${fmt(absVal, $locale)}`;
+    if (bar.value !== 0) {
+      const sign = bar.value >= 0 ? "+" : "−";
+      text += `  (${sign}${fmt(Math.abs(bar.value), $locale)})`;
+    }
+    return text;
+  }
+
+  function onDotEnter(
+    e: MouseEvent,
+    key: string,
+    bar: ChartResult["bars"][number],
+    absVal = NaN,
+  ): void {
+    tooltip = { text: dotLabel(key, bar, absVal), x: e.clientX, y: e.clientY };
+  }
+
+  let showChange = true;
+  let showValue = true;
+
+  let expandedKey: string | null = null;
+
+  function expandedChartTitle(key: string): MessageKey {
+    return chartSections.find((s) => s.key === key)?.labelKey ?? "common.stats";
+  }
+
+  function navigateExpanded(dir: -1 | 1): void {
+    if (!expandedKey) return;
+    const idx = chartSections.findIndex((s) => s.key === expandedKey);
+    if (idx < 0) return;
+    const next = (idx + dir + chartSections.length) % chartSections.length;
+    expandedKey = chartSections[next].key;
+    tooltip = null;
+  }
+
+  // The trade rail is a sibling of the scrolling column, not a grid cell, so it
+  // reads its own section state instead of going through LayoutGrid.
+  $: statsSections = sectionsOf($layoutState, "stats", $layoutBreakpoint);
+  $: statsOrder = statsSections.map((section) => section.id);
+  $: tradeRailSections = statsSections.filter(
+    (section) => section.id === "stats.trades" && !section.hidden,
+  );
+</script>
+
+<!-- Global tooltip (position: fixed, follows mouse) -->
+{#if tooltip}
+  <div
+    data-stats-tooltip
+    class="fixed pointer-events-none rounded-[var(--radius-sm)] border border-border-strong bg-bg-raised px-[10px] py-1 text-xs text-text-primary whitespace-nowrap z-[1100] shadow-[var(--ui-panel-shadow)]"
+    style="left:{tooltip.x + 14}px; top:{tooltip.y - 38}px"
+    aria-hidden="true"
+  >
+    {tooltip.text}
+  </div>
+{/if}
+
+{#if showResourcePicker}
+  <StatResourcePicker
+    onClose={() => {
+      showResourcePicker = false;
+    }}
+  />
+{/if}
+
+<!-- Expand modal -->
+{#if expandedKey !== null && expandedChartData}
+  {@const exBars = expandedChartData.bars}
+  {@const exBw = expandedChartData.bw}
+  {@const step = labelStep(chartDays)}
+  {@const exYTicks = expandedChartData.yTicks}
+  {@const exIcon = iconMap[expandedKey]}
+  <ModalShell
+    ariaLabel={$tr(expandedChartTitle(expandedKey))}
+    onClose={() => {
+      expandedKey = null;
+      tooltip = null;
+    }}
+  >
+    <div
+      class="relative z-10 flex h-[72vh] w-[86vw] flex-col overflow-hidden rounded-[var(--radius-xl)] border border-border-strong bg-bg-surface p-4 pb-3 shadow-[var(--ui-panel-shadow)]"
+    >
+      <div class="mb-3 flex shrink-0 items-center justify-between">
+        <span
+          class="flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-text-muted"
+        >
+          {#if exIcon}<img
+              src={exIcon}
+              alt=""
+              class="w-[18px] h-[18px] object-contain align-middle opacity-85"
+            />{/if}
+          {$tr(expandedChartTitle(expandedKey))}
+        </span>
+        <div class="flex items-center gap-2">
+          <ThemedButton
+            active={showValue}
+            onClick={() => {
+              showValue = !showValue;
+            }}>{$tr("stats.valueLabel")}</ThemedButton
+          >
+          <ThemedButton
+            active={showChange}
+            onClick={() => {
+              showChange = !showChange;
+            }}>{$tr("common.change")}</ThemedButton
+          >
+          <button
+            type="button"
+            aria-label={$tr("stats.closeExpandedChartAria")}
+            class="border-none bg-transparent text-text-muted cursor-pointer text-base leading-none px-1.5 py-0.5 rounded-[var(--radius-md)] transition-[color,background] duration-150 hover:text-text-primary hover:bg-bg-raised"
+            on:click={() => {
+              expandedKey = null;
+              tooltip = null;
+            }}>✕</button
+          >
+        </div>
+      </div>
+      <div class="flex-1 min-h-0 flex flex-col">
+        <button
+          class="absolute top-1/2 -translate-y-1/2 z-10 bg-bg-raised border border-border rounded-[var(--radius-md)] text-text-muted text-2xl py-1 px-[10px] cursor-pointer transition-[color,background] duration-150 hover:text-text-primary hover:bg-bg-surface left-2"
+          on:click={() => navigateExpanded(-1)}
+          title={$tr("stats.previousTitle")}>‹</button
+        >
+        <button
+          class="absolute top-1/2 -translate-y-1/2 z-10 bg-bg-raised border border-border rounded-[var(--radius-md)] text-text-muted text-2xl py-1 px-[10px] cursor-pointer transition-[color,background] duration-150 hover:text-text-primary hover:bg-bg-surface right-2"
+          on:click={() => navigateExpanded(1)}
+          title={$tr("common.next")}>›</button
+        >
+        <div class="flex-1 min-h-0 flex relative">
+          {#if exYTicks.length > 0}
+            <div class="relative w-[60px] shrink-0">
+              {#each exYTicks as tick}
+                <span
+                  class="absolute right-[6px] text-xs text-text-muted -translate-y-1/2 whitespace-nowrap"
+                  style="top:{tick.yFrac * 100}%">{tick.label}</span
+                >
+              {/each}
+            </div>
+          {/if}
+          <div class="flex-1 min-w-0 relative">
+            <svg
+              data-stats-chart-expanded={expandedKey}
+              class="w-full h-full min-h-[40px] block"
+              viewBox="0 0 {SVG_W} {BAR_H_EXPAND}"
+              preserveAspectRatio="none"
+              aria-hidden="true"
+            >
+              {#each exYTicks as tick}
+                <line
+                  x1="0"
+                  y1={tick.yFrac * BAR_H_EXPAND}
+                  x2={SVG_W}
+                  y2={tick.yFrac * BAR_H_EXPAND}
+                  stroke="rgba(255,255,255,0.12)"
+                  stroke-width="1"
+                />
+              {/each}
+              {#each exBars as bar, i}
+                {#if i > 0 && i % labelStep(chartDays) === 0}
+                  <line
+                    x1={bar.x}
+                    y1="0"
+                    x2={bar.x}
+                    y2={BAR_H_EXPAND}
+                    stroke="rgba(255,255,255,0.06)"
+                    stroke-width="1"
+                  />
+                {/if}
+              {/each}
+              <line
+                x1="0"
+                y1={expandedChartData.zeroY}
+                x2={SVG_W}
+                y2={expandedChartData.zeroY}
+                stroke="var(--border)"
+                stroke-width="0.5"
+              />
+              {#if showChange}
+                {#each exBars as bar}
+                  <rect
+                    role="img"
+                    aria-label={dotLabel(expandedKey, bar, NaN)}
+                    data-stats-date={bar.date}
+                    x={bar.x}
+                    y={bar.y}
+                    width={exBw}
+                    height={bar.h}
+                    class={bar.positive ? "fill-success opacity-75" : "fill-danger opacity-75"}
+                    rx="1"
+                    on:mouseenter={(e) => onDotEnter(e, expandedKey!, bar)}
+                    on:mouseleave={() => (tooltip = null)}
+                    ><title>{dotLabel(expandedKey, bar, NaN)}</title></rect
+                  >
+                {/each}
+              {/if}
+              {#if showValue && expandedChartData?.absLine}
+                <polyline
+                  points={expandedChartData.absLine.map((p) => `${p.x},${p.y}`).join(" ")}
+                  fill="none"
+                  stroke="rgba(255,255,255,0.85)"
+                  stroke-width="2.5"
+                  stroke-linejoin="round"
+                  stroke-linecap="round"
+                  vector-effect="non-scaling-stroke"
+                />
+              {/if}
+            </svg>
+            {#if showValue && expandedChartData?.absLine}
+              {@const firstSample = expandedChartData.absLine.find((point) => point.recorded)?.idx}
+              <div class="absolute inset-0 pointer-events-none">
+                {#each expandedChartData.absLine as pt}
+                  {@const bar = exBars[pt.idx]}
+                  {@const absVal = expandedChartData.absValues[pt.idx] ?? NaN}
+                  {#if bar && pt.recorded && (pt.idx === firstSample || bar.value !== 0)}
+                    <button
+                      data-stats-point={expandedKey}
+                      data-stats-date={bar.date}
+                      type="button"
+                      class="absolute w-[15px] h-[15px] p-0 rounded-full bg-bg-surface border-[3px] border-text-primary/80 -translate-x-1/2 -translate-y-1/2 pointer-events-auto transition-[transform,box-shadow,border-color,background] duration-[0.12s] cursor-pointer hover:scale-[1.35] hover:border-text-heading hover:bg-surface-hover hover:shadow-[0_0_6px_rgba(255,255,255,0.35)]"
+                      style="left:{(pt.x / SVG_W) * 100}%; top:{(pt.y / BAR_H_EXPAND) * 100}%"
+                      aria-label={dotLabel(expandedKey, bar, absVal)}
+                      title={dotLabel(expandedKey, bar, absVal)}
+                      on:mouseenter={(e) => onDotEnter(e, expandedKey!, bar, absVal)}
+                      on:mouseleave={() => {
+                        tooltip = null;
+                      }}
+                    ></button>
+                  {/if}
+                {/each}
+              </div>
+            {/if}
+          </div>
+        </div>
+        <!-- Per-day date labels below the expanded chart -->
+        {#if exBars.length > 0}
+          <div
+            class="flex shrink-0 h-[22px] mt-1"
+            style={exYTicks.length > 0 ? "margin-left:60px" : ""}
+          >
+            {#each exBars as bar, i}
+              <span
+                class="text-center text-xs text-text-muted whitespace-nowrap overflow-visible"
+                style="width:{100 / exBars.length}%"
+              >
+                {i % step === 0 ? shortDate(bar.date, $locale) : ""}
+              </span>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    </div>
+  </ModalShell>
+{/if}
+
+<section class="view active">
+  <div class="mb-4 shrink-0" data-stats-header>
+    <h2 class="m-0 mb-2 font-display text-3xl font-semibold tracking-[0.03em] text-text-primary">
+      {$tr("common.stats")}
+    </h2>
+    <div class="flex items-end border-b border-border-subtle">
+      <HeaderTabs
+        options={statsTabs}
+        activeKey={$statsTab}
+        onSelect={(key) => {
+          statsTab.set(key === "personal" ? "personal" : "tracking");
+          expandedKey = null;
+          tooltip = null;
+          showResourcePicker = false;
+        }}
+      />
+    </div>
+  </div>
+  {#if $statsTab === "tracking"}
+    <div class="mb-4 flex shrink-0 flex-wrap items-center justify-end gap-2" data-stats-controls>
+      <ThemedButton
+        active={showValue}
+        onClick={() => {
+          showValue = !showValue;
+        }}
+        title={$tr("stats.toggleValueTitle")}>{$tr("stats.valueLabel")}</ThemedButton
+      >
+      <ThemedButton
+        active={showChange}
+        onClick={() => {
+          showChange = !showChange;
+        }}
+        title={$tr("stats.toggleChangeTitle")}>{$tr("common.change")}</ThemedButton
+      >
+      <ThemedButton
+        onClick={() => {
+          showResourcePicker = true;
+        }}
+        title={$tr("stats.chartResourcesHint")}
+        ><span data-stats-resource-picker>{$tr("stats.chartResources")}</span></ThemedButton
+      >
+      <label
+        class="flex items-center gap-1.5 whitespace-nowrap text-xs text-text-muted"
+        data-stats-timeframe
+      >
+        {$tr("stats.timeframe")}:
+        <ThemedSelect bind:value={chartDays}>
+          {#each TIMEFRAME_OPTIONS as days}
+            <option value={days}>{days}d</option>
+          {/each}
+        </ThemedSelect>
+      </label>
+      <ThemedButton onClick={handleSaveStats} title={$tr("stats.saveJsonTitle")}>
+        {$tr("stats.saveJsonButton")}
+      </ThemedButton>
+      <ThemedButton as="label" title={$tr("stats.importAlecaTitle")}>
+        {$tr("stats.importAlecaButton")}
+        <input type="file" accept=".json" class="hidden" on:change={handleImportFile} />
+      </ThemedButton>
+      <EditLayoutBar view="stats" />
+    </div>
+  {/if}
+
+  {#if $statsTab === "personal"}
+    <PersonalStatsPanel />
+  {/if}
+  {#if trackingMounted}
+    <div
+      class="flex flex-1 min-h-0 overflow-hidden"
+      style:display={$statsTab === "tracking" ? undefined : "none"}
+      data-stats-tracking
+    >
+      {#if loading}
+        <div class="empty-state"><p>{$tr("common.loading")}</p></div>
+      {:else}
+        <!-- LEFT: session stats + charts -->
+        <div
+          class="@container flex flex-1 min-w-0 flex-col gap-4 overflow-y-auto overflow-x-hidden p-4"
+        >
+          {#if importStatus}
+            <p class="mb-3 text-xs {importError ? 'text-danger' : 'text-success'}">
+              {importStatus}
+            </p>
+          {/if}
+
+          <LayoutGrid view="stats" only={STATS_MAIN_SECTIONS} gapClass="gap-4" let:sectionId>
+            {#if sectionId === "stats.summary"}
+              {#if !session?.hasData}
+                <p class="m-0 text-sm text-text-muted">{$tr("stats.noData")}</p>
+              {:else}
+                <SummaryStrip items={sessionSummaryItems} />
+              {/if}
+            {:else if sectionId === "stats.charts"}
+              {#if history.length === 0}
+                <p class="m-0 text-sm text-text-muted">{$tr("stats.noDays")}</p>
+              {:else}
+                <!-- Container query: charts need ~300px each; stack when the column is narrow. -->
+                <div class="grid grid-cols-1 gap-3 @2xl:grid-cols-2">
+                  {#each chartSections as { key, labelKey } (key)}
+                    {@const cd = chartDataMap[key]}
+                    {@const icon = iconMap[key]}
+                    {@const empty = chartIsEmpty(cd)}
+                    <ThemedPanel
+                      className="relative flex h-[240px] min-w-0 flex-col overflow-hidden px-[13px] py-[6px] pb-2 group/chart"
+                    >
+                      <div class="flex items-center justify-between mb-1">
+                        <span class="flex items-center gap-1.5 text-sm text-text-secondary">
+                          {#if icon}<img
+                              src={icon}
+                              alt=""
+                              class="w-5 h-5 object-contain align-middle opacity-85"
+                            />{/if}
+                          {$tr(labelKey)}
+                        </span>
+                        <button
+                          data-stats-expand={key}
+                          class="bg-transparent border-0 text-text-muted cursor-pointer text-lg py-1 px-2 leading-none opacity-50 transition-[opacity,color] duration-150 rounded-[var(--radius-md)] hover:!opacity-100 hover:text-accent hover:bg-bg-raised group-hover/chart:opacity-70"
+                          title={$tr("stats.expandChartTitle")}
+                          on:click={() => {
+                            expandedKey = key;
+                            tooltip = null;
+                          }}
+                          aria-label={$tr("stats.expandChartAria", { label: $tr(labelKey) })}
+                          >⛶</button
+                        >
+                      </div>
+                      {#if empty}
+                        <div
+                          class="flex-1 min-h-0 flex items-center justify-center text-sm text-text-muted"
+                        >
+                          {$tr("stats.noDataTimeframe")}
+                        </div>
+                      {:else}
+                        <div class="flex-1 min-h-0 flex">
+                          {#if cd.yTicks.length > 0}
+                            <div class="relative w-[55px] shrink-0">
+                              {#each cd.yTicks as tick}
+                                <span
+                                  class="absolute right-1 text-xs text-text-muted -translate-y-1/2 whitespace-nowrap"
+                                  style="top:{tick.yFrac * 100}%">{tick.label}</span
+                                >
+                              {/each}
+                            </div>
+                          {/if}
+                          <div class="flex-1 min-h-0 min-w-0 relative">
+                            <svg
+                              data-stats-chart={key}
+                              class="w-full h-full cursor-default"
+                              viewBox="0 0 {SVG_W} {BAR_H}"
+                              preserveAspectRatio="none"
+                              aria-hidden="true"
+                            >
+                              {#each cd.yTicks as tick}
+                                <line
+                                  x1="0"
+                                  y1={tick.yFrac * BAR_H}
+                                  x2={SVG_W}
+                                  y2={tick.yFrac * BAR_H}
+                                  stroke="rgba(255,255,255,0.12)"
+                                  stroke-width="1"
+                                />
+                              {/each}
+                              {#each cd.bars as bar, i}
+                                {#if i > 0 && i % labelStep(chartDays) === 0}
+                                  <line
+                                    x1={bar.x}
+                                    y1="0"
+                                    x2={bar.x}
+                                    y2={BAR_H}
+                                    stroke="rgba(255,255,255,0.06)"
+                                    stroke-width="1"
+                                  />
+                                {/if}
+                              {/each}
+                              <line
+                                x1="0"
+                                y1={cd.zeroY}
+                                x2={SVG_W}
+                                y2={cd.zeroY}
+                                stroke="var(--border)"
+                                stroke-width="0.5"
+                              />
+                              {#if showChange}
+                                {#each cd.bars as bar}
+                                  <rect
+                                    role="img"
+                                    aria-label={dotLabel(key, bar, NaN)}
+                                    data-stats-date={bar.date}
+                                    data-stats-value={bar.value}
+                                    x={bar.x}
+                                    y={bar.y}
+                                    width={cd.bw}
+                                    height={bar.h}
+                                    class={bar.positive
+                                      ? "fill-success opacity-75"
+                                      : "fill-danger opacity-75"}
+                                    rx="1"
+                                    on:mouseenter={(e) => onDotEnter(e, key, bar)}
+                                    on:mouseleave={() => (tooltip = null)}
+                                    ><title>{dotLabel(key, bar, NaN)}</title></rect
+                                  >
+                                {/each}
+                              {/if}
+                              {#if showValue && cd.absLine}
+                                <polyline
+                                  points={cd.absLine.map((p) => `${p.x},${p.y}`).join(" ")}
+                                  fill="none"
+                                  stroke="rgba(255,255,255,0.7)"
+                                  stroke-width="1.5"
+                                  stroke-linejoin="round"
+                                  stroke-linecap="round"
+                                  vector-effect="non-scaling-stroke"
+                                />
+                              {/if}
+                            </svg>
+                            {#if showValue && cd.absLine}
+                              {@const firstSample = cd.absLine.find((point) => point.recorded)?.idx}
+                              <div class="absolute inset-0 pointer-events-none">
+                                {#each cd.absLine as pt}
+                                  {@const bar = cd.bars[pt.idx]}
+                                  {@const absVal = cd.absValues[pt.idx] ?? NaN}
+                                  {#if bar && pt.recorded && (pt.idx === firstSample || bar.value !== 0)}
+                                    <button
+                                      data-stats-point={key}
+                                      data-stats-date={bar.date}
+                                      type="button"
+                                      class="absolute w-3 h-3 p-0 rounded-full bg-bg-surface border-2 border-text-primary/80 -translate-x-1/2 -translate-y-1/2 pointer-events-auto transition-[transform,box-shadow,border-color,background] duration-[0.12s] cursor-pointer hover:scale-[1.35] hover:border-text-heading hover:bg-surface-hover hover:shadow-[0_0_6px_rgba(255,255,255,0.35)]"
+                                      style="left:{(pt.x / SVG_W) * 100}%; top:{(pt.y / BAR_H) *
+                                        100}%"
+                                      aria-label={dotLabel(key, bar, absVal)}
+                                      title={dotLabel(key, bar, absVal)}
+                                      on:mouseenter={(e) => onDotEnter(e, key, bar, absVal)}
+                                      on:mouseleave={() => {
+                                        tooltip = null;
+                                      }}
+                                    ></button>
+                                    {#if cd.absLine.length === 1 && !Number.isNaN(absVal)}
+                                      <!-- A lone dot in an empty grid reads as noise;
+                                     with no neighbour to compare it to, print it.
+                                     Flips side past the midpoint so it stays in. -->
+                                      {@const flip = pt.x / SVG_W > 0.5}
+                                      <span
+                                        class="absolute -translate-y-1/2 whitespace-nowrap text-xs text-text-secondary {flip
+                                          ? '-translate-x-full -ml-2'
+                                          : 'ml-2'}"
+                                        style="left:{(pt.x / SVG_W) * 100}%; top:{(pt.y / BAR_H) *
+                                          100}%"
+                                        data-stats-single-point
+                                      >
+                                        {formatterFor(key)(absVal, $locale)}
+                                      </span>
+                                    {/if}
+                                  {/if}
+                                {/each}
+                              </div>
+                            {/if}
+                          </div>
+                        </div>
+                        {#if cd.bars.length > 0}
+                          {@const dateStep = labelStep(chartDays)}
+                          <div
+                            class="flex text-xs text-text-muted mt-0.5 overflow-visible shrink-0 h-[18px]"
+                            style={cd.yTicks.length > 0 ? "margin-left:55px" : ""}
+                          >
+                            {#each cd.bars as bar, i}
+                              <span
+                                class="text-center overflow-visible whitespace-nowrap shrink-0 text-xs"
+                                style="width:{100 / cd.bars.length}%"
+                              >
+                                {i % dateStep === 0 ? shortDate(bar.date, $locale) : ""}
+                              </span>
+                            {/each}
+                          </div>
+                        {/if}
+                      {/if}
+                    </ThemedPanel>
+                  {/each}
+                </div>
+              {/if}
+            {/if}
+          </LayoutGrid>
+        </div>
+        <!-- /stats-left -->
+
+        {#each tradeRailSections as section (section.id)}
+          <LayoutSection
+            view="stats"
+            breakpoint={$layoutBreakpoint}
+            order={statsOrder}
+            id={section.id}
+            span={section.span}
+            collapsed={section.collapsed}
+            className="flex min-h-0 shrink-0 flex-col"
+          >
+            <StatsTradePanel {trades} />
+          </LayoutSection>
+        {/each}
+      {/if}
+    </div>
+    <!-- /stats-layout -->
+  {/if}
+</section>

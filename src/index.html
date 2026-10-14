@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- CSP is enforced at runtime via onHeadersReceived in main.ts with a
+         strict connect-src allowlist. A <meta> tag here would be less
+         restrictive (connect-src 'self' https:) and becomes the sole policy
+         if the runtime header ever fails to apply, so we omit it. -->
+    <title>WFHelper</title>
+    <!-- Relative to renderer/dist/index.html: the overlays share renderer/fonts unbundled. -->
+    <link rel="stylesheet" href="../fonts/fonts.css" vite-ignore />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

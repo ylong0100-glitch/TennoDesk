@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data: https:; connect-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none';"
+    />
+    <title data-i18n="settings.rivenOverlay">Riven Overlay</title>
+    <link rel="stylesheet" href="fonts/fonts.css" />
+    <link rel="stylesheet" href="riven-overlay.css" />
+    <link rel="stylesheet" href="overlay-layout.css" />
+  </head>
+  <body>
+    <!-- Each window is one panel (left=current or right=new roll).
+         The ?side= query parameter determines which data this window displays. -->
+    <div id="panel">
+      <div id="header">
+        <div id="header-left">
+          <div id="panel-label">Current</div>
+          <div id="weapon-name">&mdash;</div>
+        </div>
+        <div id="header-right">
+          <div id="roll-badge">Roll 0</div>
+          <button
+            id="btn-rescan"
+            class="is-hidden"
+            data-i18n-title="overlay.riven.rescan"
+            title="Rescan card and linked weapon"
+          >
+            &#8635;
+          </button>
+          <button id="btn-close" data-i18n-title="common.close" title="Close">&times;</button>
+        </div>
+      </div>
+
+      <!-- Overall grade (shown when grading data arrives) -->
+      <div id="overall-grade" class="is-hidden">
+        <span id="overall-grade-badge" class="attr-grade-badge">?</span>
+      </div>
+
+      <div id="scanning-state">
+        <div class="scan-spinner"></div>
+        <div id="scanning-text">Scanning...</div>
+      </div>
+
+      <div id="stats-container" class="is-hidden">
+        <div id="stats-list"></div>
+      </div>
+
+      <div id="error-banner">
+        Couldn't read the riven. Keep the card visible and set Warframe's UI language to English.
+      </div>
+
+      <div id="weapon-warning" class="is-hidden" data-i18n="overlay.riven.weaponMissing">
+        Couldn't read the weapon name, so there are no grades. Use the rescan button to retry.
+      </div>
+
+      <!-- Best attributes (shown when weapon is identified) -->
+      <div id="best-attributes" class="is-hidden">
+        <div id="best-pos" class="best-row"></div>
+        <div id="best-neg" class="best-row"></div>
+      </div>
+
+      <!-- Similar rivens from WFM (shown when search completes) -->
+      <div id="similar-listings" class="is-hidden">
+        <div id="similar-header">
+          <span id="similar-title" data-i18n="rivens.detail.similarOnWfm">Similar on WFM</span>
+          <button
+            id="btn-similar-auctions"
+            type="button"
+            class="active"
+            aria-pressed="true"
+            data-i18n="rivens.detail.auctionsChip"
+            data-i18n-title="rivens.detail.auctionsChipTitle"
+            title="Include auctions sold by bidding. Off shows direct sales only."
+          >
+            Auctions
+          </button>
+        </div>
+        <div id="similar-list"></div>
+      </div>
+
+      <div id="interaction-hint" class="is-hidden"></div>
+    </div>
+    <script src="reward-editor-bridge.js"></script>
+    <script src="reward-layout.js"></script>
+    <script src="overlay-drag.js"></script>
+    <script src="overlay-theme.js"></script>
+    <script src="overlay-i18n.js"></script>
+    <script type="module" src="riven-overlay.js"></script>
+  </body>
+</html>

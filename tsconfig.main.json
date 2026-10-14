@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "lib": ["ES2020", "ES2022.Error"],
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "strict": true,
+    "noImplicitAny": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "types": ["node", "electron"],
+    "rootDir": ".",
+    "outDir": ".electron-build",
+    "noEmitOnError": true
+  },
+  "include": ["main.ts", "preload.ts", "preload-overlay.ts", "preload-riven.ts", "preload-trade-notification.ts", "preload-arbi.ts", "ipc/**/*.ts", "services/**/*.ts", "config/**/*.ts"]
+}

@@ -1,0 +1,252 @@
+import { toFiniteNumber } from "../config/shared/numeric";
+import { WFM_MOD_VARIANTS, WFM_ORDER_SUBTYPES } from "../config/shared/wfmOrders";
+import { isObject } from "./ipcValidators";
+import { toNonEmptyString } from "../config/shared/stringValidation";
+
+const WFM_ID_RE = /^[a-f0-9]{24}$/i;
+const VALID_ORDER_TYPES = new Set(["sell", "buy"]);
+const VALID_ORDER_SUBTYPES = new Set<string>([...WFM_ORDER_SUBTYPES, ...WFM_MOD_VARIANTS]);
+const VALID_STATUSES = new Set(["online", "ingame", "invisible"]);
+
+const EMAIL_MAX_LENGTH = 254;
+const PASSWORD_MAX_LENGTH = 512;
+const SEARCH_QUERY_MAX_LENGTH = 120;
+const SEARCH_LIMIT_DEFAULT = 20;
+const SEARCH_LIMIT_MIN = 1;
+const SEARCH_LIMIT_MAX = 100;
+const CONTRACTS_PAGE_DEFAULT = 1;
+const CONTRACTS_PAGE_MIN = 1;
+const CONTRACTS_PAGE_MAX = 500;
+const CONTRACTS_LIMIT_DEFAULT = 40;
+const CONTRACTS_LIMIT_MIN = 1;
+const CONTRACTS_LIMIT_MAX = 100;
+const MAX_BULK_ORDER_IDS = 200;
+const MAX_PLATINUM = 10_000_000;
+const MAX_QUANTITY = 99_999;
+const MIN_MOD_RANK = 0;
+const MAX_MOD_RANK = 20;
+
+type ParsedCredentials = { email: string; password: string };
+type ParsedCreateOrderParams = {
+  itemId: string;
+  orderType: string;
+  platinum: number;
+  quantity: number;
+  visible: boolean;
+  modRank?: number;
+  subtype?: string;
+};
+type ParsedUpdateOrderPayload = {
+  orderId: string;
+  updates: {
+    platinum?: number;
+    quantity?: number;
+    visible?: boolean;
+    modRank?: number;
+    subtype?: string;
+  };
+};
+type ParsedOrderIdPayload = { orderId: string };
+type ParsedCloseOrderPayload = { orderId: string; quantity: number };
+type ParsedSetVisiblePayload = { orderIds: string[]; visible: boolean };
+type ParsedSearchPayload = { query: string; limit: number };
+type ParsedStatusPayload = { status: string };
+type ParsedContractsPayload = { page: number; limit: number };
+
+function toClampedInteger(value: unknown, min: number, max: number): number | null {
+  const n = toFiniteNumber(value);
+  if (n == null) return null;
+  const rounded = Math.round(n);
+  if (rounded < min || rounded > max) return null;
+  return rounded;
+}
+
+function errorCode(err: unknown): string | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  return (err as { code?: string }).code;
+}
+
+function parseCredentials(payload: unknown): ParsedCredentials | null {
+  if (!isObject(payload)) return null;
+
+  const email = toNonEmptyString(payload.email, EMAIL_MAX_LENGTH);
+  const password = typeof payload.password === "string" ? payload.password : null;
+  if (!email || !password || password.length > PASSWORD_MAX_LENGTH) return null;
+
+  return { email, password };
+}
+
+function parseCreateOrderParams(payload: unknown): ParsedCreateOrderParams | null {
+  if (!isObject(payload)) return null;
+
+  const itemId = toNonEmptyString(payload.itemId, 64);
+  const orderType = toNonEmptyString(payload.orderType, 10)?.toLowerCase() ?? null;
+  const platinum = toClampedInteger(payload.platinum, 1, MAX_PLATINUM);
+  const quantity = toClampedInteger(payload.quantity, 1, MAX_QUANTITY);
+
+  if (!itemId || !WFM_ID_RE.test(itemId)) return null;
+  if (!orderType || !VALID_ORDER_TYPES.has(orderType)) return null;
+  if (platinum == null || quantity == null) return null;
+
+  const parsed: ParsedCreateOrderParams = {
+    itemId,
+    orderType,
+    platinum,
+    quantity,
+    visible: payload.visible === undefined ? true : Boolean(payload.visible),
+  };
+
+  if (payload.modRank !== undefined) {
+    const modRank = toClampedInteger(payload.modRank, MIN_MOD_RANK, MAX_MOD_RANK);
+    if (modRank == null) return null;
+    parsed.modRank = modRank;
+  }
+
+  if (payload.subtype !== undefined) {
+    const subtype = toNonEmptyString(payload.subtype, 20)?.toLowerCase() ?? null;
+    if (!subtype || !VALID_ORDER_SUBTYPES.has(subtype)) return null;
+    parsed.subtype = subtype;
+  }
+
+  return parsed;
+}
+
+function parseUpdateOrderPayload(payload: unknown): ParsedUpdateOrderPayload | null {
+  if (!isObject(payload)) return null;
+
+  const orderId = toNonEmptyString(payload.orderId, 64);
+  if (!orderId || !WFM_ID_RE.test(orderId)) return null;
+
+  const updates = isObject(payload.updates) ? payload.updates : {};
+  const parsedUpdates: ParsedUpdateOrderPayload["updates"] = {};
+
+  if (updates.platinum !== undefined) {
+    const platinum = toClampedInteger(updates.platinum, 1, MAX_PLATINUM);
+    if (platinum == null) return null;
+    parsedUpdates.platinum = platinum;
+  }
+
+  if (updates.quantity !== undefined) {
+    const quantity = toClampedInteger(updates.quantity, 1, MAX_QUANTITY);
+    if (quantity == null) return null;
+    parsedUpdates.quantity = quantity;
+  }
+
+  if (updates.visible !== undefined) {
+    parsedUpdates.visible = Boolean(updates.visible);
+  }
+
+  if (updates.modRank !== undefined) {
+    const modRank = toClampedInteger(updates.modRank, MIN_MOD_RANK, MAX_MOD_RANK);
+    if (modRank == null) return null;
+    parsedUpdates.modRank = modRank;
+  }
+
+  if (updates.subtype !== undefined) {
+    const subtype = toNonEmptyString(updates.subtype, 20)?.toLowerCase() ?? null;
+    if (!subtype || !VALID_ORDER_SUBTYPES.has(subtype)) return null;
+    parsedUpdates.subtype = subtype;
+  }
+
+  return { orderId, updates: parsedUpdates };
+}
+
+function parseOrderIdPayload(payload: unknown): ParsedOrderIdPayload | null {
+  if (!isObject(payload)) return null;
+  const orderId = toNonEmptyString(payload.orderId, 64);
+  if (!orderId || !WFM_ID_RE.test(orderId)) return null;
+  return { orderId };
+}
+
+// No rounding: a fractional close quantity is a caller bug, not a request to send.
+function parseCloseOrderPayload(payload: unknown): ParsedCloseOrderPayload | null {
+  const parsed = parseOrderIdPayload(payload);
+  if (!parsed || !isObject(payload)) return null;
+  const { quantity } = payload;
+  if (typeof quantity !== "number" || !Number.isInteger(quantity)) return null;
+  if (quantity < 1 || quantity > MAX_QUANTITY) return null;
+  return { orderId: parsed.orderId, quantity };
+}
+
+function parseSetVisiblePayload(payload: unknown): ParsedSetVisiblePayload | null {
+  if (!isObject(payload)) return null;
+  if (typeof payload.visible !== "boolean") return null;
+  if (!Array.isArray(payload.orderIds)) return null;
+
+  const orderIds = payload.orderIds
+    .map((value: unknown) => toNonEmptyString(value, 64))
+    .filter((value): value is string => Boolean(value && WFM_ID_RE.test(value)))
+    .slice(0, MAX_BULK_ORDER_IDS);
+
+  if (orderIds.length === 0) return null;
+  return {
+    orderIds,
+    visible: payload.visible,
+  };
+}
+
+function parseSearchPayload(payload: unknown): ParsedSearchPayload | null {
+  if (!isObject(payload)) return null;
+
+  const query = toNonEmptyString(payload.query, SEARCH_QUERY_MAX_LENGTH);
+  if (!query) return null;
+
+  const rawLimit =
+    payload.limit === undefined
+      ? SEARCH_LIMIT_DEFAULT
+      : toClampedInteger(payload.limit, SEARCH_LIMIT_MIN, SEARCH_LIMIT_MAX);
+
+  if (rawLimit == null) return null;
+
+  return {
+    query,
+    limit: rawLimit,
+  };
+}
+
+function parseStatusPayload(payload: unknown): ParsedStatusPayload | null {
+  if (!isObject(payload)) return null;
+
+  const status = toNonEmptyString(payload.status, 24)?.toLowerCase() ?? null;
+  if (!status || !VALID_STATUSES.has(status)) return null;
+
+  return { status };
+}
+
+function parseContractsPayload(payload: unknown): ParsedContractsPayload | null {
+  if (payload == null) {
+    return {
+      page: CONTRACTS_PAGE_DEFAULT,
+      limit: CONTRACTS_LIMIT_DEFAULT,
+    };
+  }
+
+  if (!isObject(payload)) return null;
+
+  const page =
+    payload.page === undefined
+      ? CONTRACTS_PAGE_DEFAULT
+      : toClampedInteger(payload.page, CONTRACTS_PAGE_MIN, CONTRACTS_PAGE_MAX);
+
+  const limit =
+    payload.limit === undefined
+      ? CONTRACTS_LIMIT_DEFAULT
+      : toClampedInteger(payload.limit, CONTRACTS_LIMIT_MIN, CONTRACTS_LIMIT_MAX);
+
+  if (page == null || limit == null) return null;
+
+  return { page, limit };
+}
+
+export {
+  parseCredentials,
+  parseCreateOrderParams,
+  parseUpdateOrderPayload,
+  parseOrderIdPayload,
+  parseCloseOrderPayload,
+  parseSetVisiblePayload,
+  parseSearchPayload,
+  parseStatusPayload,
+  parseContractsPayload,
+  errorCode,
+};

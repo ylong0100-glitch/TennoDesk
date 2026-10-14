@@ -1,0 +1,682 @@
+<script lang="ts">
+  import { itemLabel } from "../../lib/itemLabel.js";
+  import { onDestroy } from "svelte";
+
+  import { tr, type MessageKey, type Translator } from "../../lib/i18n.js";
+  import ItemImage from "../ItemImage.svelte";
+  import InventoryOrderBookSide from "./InventoryOrderBookSide.svelte";
+  import MarketStatsModal from "../market/MarketStatsModal.svelte";
+  import { activeItem } from "../../stores/modals.js";
+  import { itemDb, componentOwnership } from "../../stores/data.js";
+  import { buildParsedItemFromDb } from "../../lib/parsedItemFromDb.js";
+  import { invoke, send } from "../../lib/ipc.js";
+  import { isIpcError as isLookupError } from "../../lib/ipcGuards.js";
+  import { useInterval } from "../../lib/timers.js";
+  import { orderModalState } from "../../stores/market.js";
+  import {
+    clearOrderBookCache,
+    fetchItemOrderBookBySlug,
+    type ItemOrderBook,
+    type OrderBookEntry,
+  } from "../../lib/wfm/orderBook.js";
+  import type { InventoryViewItem } from "../../lib/inventoryMarket.js";
+  import type { WfmLookupItem, OrderType } from "../../types/market.js";
+  import {
+    normalizeRankFilter,
+    isRankedGroup,
+    resolveRankedMaxRank,
+  } from "../../../config/shared/numeric.js";
+  import { formatUnitPlatinum, isActiveOrderStatus } from "../../../config/shared/wfmOrders.js";
+  import { ayatanSculptureBySlug } from "../../../config/shared/ayatanEndo.js";
+  import { ayatanOrderWhisper } from "../../lib/wfm/ayatanListings.js";
+
+  export let item: InventoryViewItem | null = null;
+  export let onClose: (() => void) | null = null;
+
+  let statsSlug: string | null = null;
+  let statsTitle = "";
+
+  type OrderSide = OrderType;
+  type SideSort = "best" | "price_low" | "price_high" | "quantity_high" | "name_asc";
+
+  const SELL_SORT_OPTIONS: Array<{ value: SideSort; labelKey: MessageKey }> = [
+    { value: "best", labelKey: "orderbook.sort.bestPrice" },
+    { value: "price_high", labelKey: "orderbook.sort.priceHighToLow" },
+    { value: "quantity_high", labelKey: "orderbook.sort.quantityHighToLow" },
+    { value: "name_asc", labelKey: "orderbook.sort.nameAsc" },
+  ];
+
+  const BUY_SORT_OPTIONS: Array<{ value: SideSort; labelKey: MessageKey }> = [
+    { value: "best", labelKey: "orderbook.sort.bestOffer" },
+    { value: "price_low", labelKey: "orderbook.sort.priceLowToHigh" },
+    { value: "quantity_high", labelKey: "orderbook.sort.quantityHighToLow" },
+    { value: "name_asc", labelKey: "orderbook.sort.nameAsc" },
+  ];
+
+  const AUTO_REFRESH_MS = 45_000;
+  const FEEDBACK_TTL_MS = 2_500;
+  const DISPLAY_ROWS_PER_SIDE = 20;
+
+  let currentSlug: string | null = null;
+  let currentRankFilter: number | null = null;
+  let currentSubtype: string | null = null;
+  let orderBook: ItemOrderBook | null = null;
+  let loading = false;
+  let errorMessage = "";
+  let feedbackMessage = "";
+  let noData = false;
+  let requestToken = 0;
+  let autoRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let feedbackTimer: ReturnType<typeof setTimeout> | null = null;
+  let stopAgeTick: (() => void) | null = null;
+  let nowTimestamp = Date.now();
+  let onlineIngameOnly = true;
+  let sellSort: SideSort = "best";
+  let buySort: SideSort = "best";
+  let selectedRank = 0;
+
+  const didItemKeyChange = (() => {
+    let previous = "";
+    return (next: string): boolean => {
+      if (next === previous) return false;
+      previous = next;
+      return true;
+    };
+  })();
+
+  const didRequestKeyChange = (() => {
+    let previous: string | null = null;
+    return (next: string | null): boolean => {
+      if (next === previous) return false;
+      previous = next;
+      return true;
+    };
+  })();
+
+  $: panelDbEntry = item ? ($itemDb || {})[item.internalName] : null;
+  $: parentUniqueName = panelDbEntry?.isBuildComponent ? panelDbEntry.componentOf || null : null;
+  $: parentEntry = parentUniqueName ? ($itemDb || {})[parentUniqueName] || null : null;
+
+  function openParentItem(): void {
+    if (!parentUniqueName || !parentEntry) return;
+    activeItem.set(buildParsedItemFromDb(parentUniqueName, parentEntry, $componentOwnership));
+  }
+
+  $: isRankedListingItem = isRankedGroup(item?.inventoryGroup);
+  $: itemRankValue = normalizeRankFilter(item?.rank);
+  $: itemMaxRankValue = normalizeRankFilter(item?.maxRank);
+  $: maxSelectableRank = isRankedListingItem
+    ? Math.max(0, itemMaxRankValue ?? resolveRankedMaxRank(item?.inventoryGroup))
+    : 0;
+  $: rankOptions = isRankedListingItem
+    ? Array.from({ length: Math.max(1, maxSelectableRank + 1) }, (_, idx) => idx)
+    : [];
+
+  $: itemKey = item
+    ? `${item.internalName}:${item.rank}:${item.maxRank}:${item.inventoryGroup}`
+    : "";
+  $: if (didItemKeyChange(itemKey)) {
+    if (isRankedListingItem && item) {
+      const defaultRank = itemRankValue ?? 0;
+      selectedRank = Math.max(0, Math.min(defaultRank, maxSelectableRank));
+    } else {
+      selectedRank = 0;
+    }
+  }
+
+  $: {
+    const normalized = normalizeRankFilter(selectedRank);
+    const bounded = Math.max(0, Math.min(normalized ?? 0, maxSelectableRank));
+    if (bounded !== selectedRank) {
+      selectedRank = bounded;
+    }
+  }
+
+  $: requestRank = isRankedListingItem ? (normalizeRankFilter(selectedRank) ?? 0) : null;
+
+  $: filteredSellBase = filterStatus(orderBook?.sell ?? [], onlineIngameOnly);
+  $: filteredBuyBase = filterStatus(orderBook?.buy ?? [], onlineIngameOnly);
+  $: hiddenSell = (orderBook?.sell.length ?? 0) - filteredSellBase.length;
+  $: hiddenBuy = (orderBook?.buy.length ?? 0) - filteredBuyBase.length;
+  $: bestSell =
+    filteredSellBase.length > 0
+      ? Math.min(...filteredSellBase.map((entry) => entry.unitPlatinum))
+      : null;
+  $: bestBuy =
+    filteredBuyBase.length > 0
+      ? Math.max(...filteredBuyBase.map((entry) => entry.unitPlatinum))
+      : null;
+  $: spread = bestSell != null && bestBuy != null ? bestSell - bestBuy : null;
+  $: sellRows = sortEntries(filteredSellBase, "sell", sellSort).slice(0, DISPLAY_ROWS_PER_SIDE);
+  $: buyRows = sortEntries(filteredBuyBase, "buy", buySort).slice(0, DISPLAY_ROWS_PER_SIDE);
+
+  $: slug = item?.marketSlug || null;
+  $: sculpture = ayatanSculptureBySlug(slug);
+  $: itemSubtype = item?.subtype ?? null;
+  $: requestKey = slug
+    ? `${slug}|${requestRank == null ? "all" : `r${requestRank}`}|${itemSubtype ?? "all"}`
+    : null;
+  $: if (didRequestKeyChange(requestKey)) {
+    currentSlug = slug;
+    currentRankFilter = requestRank;
+    currentSubtype = itemSubtype;
+    resetAutoRefresh(null, null);
+    void load(currentSlug, currentRankFilter, currentSubtype);
+  }
+
+  onDestroy(() => {
+    if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
+    if (feedbackTimer) clearTimeout(feedbackTimer);
+    stopAgeTick?.();
+  });
+
+  function setAgeTick(enabled: boolean): void {
+    stopAgeTick?.();
+    stopAgeTick = null;
+    if (!enabled) return;
+    stopAgeTick = useInterval(() => {
+      nowTimestamp = Date.now();
+    }, 1_000);
+  }
+
+  function resetAutoRefresh(nextSlug: string | null, nextRank: number | null): void {
+    if (autoRefreshTimer) {
+      clearTimeout(autoRefreshTimer);
+      autoRefreshTimer = null;
+    }
+    if (!nextSlug) return;
+    autoRefreshTimer = setTimeout(() => {
+      if (nextSlug !== currentSlug) return;
+      if (nextRank !== currentRankFilter) return;
+      clearOrderBookCache(nextSlug, nextRank, currentSubtype);
+      void load(nextSlug, nextRank, currentSubtype);
+    }, AUTO_REFRESH_MS);
+  }
+
+  async function load(
+    slugToLoad: string | null,
+    rankToLoad: number | null,
+    subtypeToLoad: string | null = null,
+  ): Promise<void> {
+    const token = ++requestToken;
+
+    orderBook = null;
+    errorMessage = "";
+    noData = false;
+
+    if (!slugToLoad) {
+      loading = false;
+      setAgeTick(false);
+      return;
+    }
+
+    loading = true;
+
+    let result = await fetchItemOrderBookBySlug(slugToLoad, {
+      rank: rankToLoad,
+      subtype: subtypeToLoad,
+    });
+    if (result.status === "error") {
+      clearOrderBookCache(slugToLoad, rankToLoad, subtypeToLoad);
+      result = await fetchItemOrderBookBySlug(slugToLoad, {
+        rank: rankToLoad,
+        subtype: subtypeToLoad,
+      });
+    }
+    if (token !== requestToken) return;
+
+    loading = false;
+    if (result.status === "ok") {
+      orderBook = result.data;
+      nowTimestamp = Date.now();
+      setAgeTick(true);
+      resetAutoRefresh(slugToLoad, rankToLoad);
+      return;
+    }
+    if (result.status === "not_found") {
+      setAgeTick(false);
+      noData = true;
+      resetAutoRefresh(slugToLoad, rankToLoad);
+      return;
+    }
+    setAgeTick(false);
+    resetAutoRefresh(slugToLoad, rankToLoad);
+    errorMessage = $tr("common.failedToLoadListingsTryAgain");
+  }
+
+  function setFeedback(message: string): void {
+    feedbackMessage = message;
+    if (feedbackTimer) {
+      clearTimeout(feedbackTimer);
+      feedbackTimer = null;
+    }
+    if (!message) return;
+    feedbackTimer = setTimeout(() => {
+      feedbackMessage = "";
+      feedbackTimer = null;
+    }, FEEDBACK_TTL_MS);
+  }
+
+  function refresh(): void {
+    if (!currentSlug) return;
+    clearOrderBookCache(currentSlug, currentRankFilter, currentSubtype);
+    void load(currentSlug, currentRankFilter, currentSubtype);
+  }
+
+  function openOnWarframeMarket(): void {
+    if (!currentSlug) return;
+    send("open-external", `https://warframe.market/items/${currentSlug}`);
+  }
+
+  function openStats(): void {
+    if (!currentSlug) return;
+    statsSlug = currentSlug;
+    statsTitle = item ? itemLabel(item) : currentSlug;
+  }
+
+  function closeStats(): void {
+    statsSlug = null;
+  }
+
+  function filterStatus(entries: OrderBookEntry[], activeOnly: boolean): OrderBookEntry[] {
+    if (!activeOnly) return [...entries];
+    return entries.filter((entry) => isActiveOrderStatus(entry.status));
+  }
+
+  function compareBestSide(a: OrderBookEntry, b: OrderBookEntry, side: OrderSide): number {
+    if (a.unitPlatinum !== b.unitPlatinum) {
+      return side === "sell" ? a.unitPlatinum - b.unitPlatinum : b.unitPlatinum - a.unitPlatinum;
+    }
+    if (a.quantity !== b.quantity) {
+      return b.quantity - a.quantity;
+    }
+    return a.userName.localeCompare(b.userName);
+  }
+
+  function sortEntries(
+    entries: OrderBookEntry[],
+    side: OrderSide,
+    mode: SideSort,
+  ): OrderBookEntry[] {
+    const rows = [...entries];
+    rows.sort((a, b) => {
+      if (mode === "best") {
+        return compareBestSide(a, b, side);
+      }
+
+      if (mode === "price_low") {
+        if (a.unitPlatinum !== b.unitPlatinum) return a.unitPlatinum - b.unitPlatinum;
+        return b.quantity - a.quantity;
+      }
+
+      if (mode === "price_high") {
+        if (a.unitPlatinum !== b.unitPlatinum) return b.unitPlatinum - a.unitPlatinum;
+        return b.quantity - a.quantity;
+      }
+
+      if (mode === "quantity_high") {
+        if (a.quantity !== b.quantity) return b.quantity - a.quantity;
+        return compareBestSide(a, b, side);
+      }
+
+      return a.userName.localeCompare(b.userName);
+    });
+    return rows;
+  }
+
+  function formatUpdatedLabel(
+    t: Translator,
+    timestamp: number | null | undefined,
+    nowMs: number,
+  ): string {
+    if (!timestamp || timestamp <= 0) return t("common.updatedRecently");
+    const ageSec = Math.max(0, Math.floor((nowMs - timestamp) / 1000));
+    if (ageSec < 5) return t("common.updatedJustNow");
+    if (ageSec < 60) return t("common.updatedSAgo", { sec: ageSec });
+    const ageMin = Math.floor(ageSec / 60);
+    if (ageMin < 60) return t("common.updatedMAgo", { min: ageMin });
+    const ageHr = Math.floor(ageMin / 60);
+    return t("common.updatedHAgo", { hr: ageHr });
+  }
+
+  function buildWhisper(entry: OrderBookEntry, side: OrderSide): string {
+    if (!item) return "";
+    const rankSuffix = isRankedListingItem ? ` (Rank ${entry.rank ?? 0})` : "";
+    return ayatanOrderWhisper($tr, side, entry, `${item.name}${rankSuffix}`, sculpture);
+  }
+
+  async function copyWhisper(entry: OrderBookEntry, side: OrderSide): Promise<void> {
+    const message = buildWhisper(entry, side);
+    if (!message) return;
+
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(message);
+        setFeedback($tr("orderbook.whisperCopied"));
+        return;
+      }
+      setFeedback($tr("common.clipboardUnavailableInThisEnvironment"));
+    } catch {
+      setFeedback($tr("common.failedToCopyWhisper"));
+    }
+  }
+
+  function openSellerProfile(entry: OrderBookEntry): void {
+    send("open-external", `https://warframe.market/profile/${encodeURIComponent(entry.userName)}`);
+  }
+
+  function isLookupItem(value: unknown): value is WfmLookupItem {
+    if (!value || typeof value !== "object") return false;
+    const row = value as Record<string, unknown>;
+    return (
+      typeof row.id === "string" &&
+      row.id.trim().length > 0 &&
+      typeof row.item_name === "string" &&
+      row.item_name.trim().length > 0 &&
+      typeof row.url_name === "string" &&
+      row.url_name.trim().length > 0
+    );
+  }
+
+  async function openPostOrder(orderType: "sell" | "buy"): Promise<void> {
+    if (!currentSlug) return;
+
+    const session = await invoke("wfmGetSession");
+    if (!session.loggedIn) {
+      setFeedback($tr("orderbook.signInFirst"));
+      return;
+    }
+
+    const lookup = await invoke("wfmLookupItemBySlug", currentSlug);
+    if (isLookupError(lookup)) {
+      setFeedback(lookup.error || $tr("orderbook.prepareOrderFailed"));
+      return;
+    }
+    if (!isLookupItem(lookup)) {
+      setFeedback($tr("orderbook.prepareOrderFailed"));
+      return;
+    }
+
+    orderModalState.set({
+      mode: "create",
+      order: null,
+      draft: {
+        item: lookup,
+        orderType,
+        modRank: requestRank,
+        maxRank: isRankedListingItem ? itemMaxRankValue : null,
+        subtype: itemSubtype,
+      },
+    });
+  }
+</script>
+
+<aside
+  data-orderbook-panel
+  class="inventory-orderbook-panel sticky flex flex-col gap-2.5 rounded-lg border border-border bg-bg-surface p-2.5 min-[1101px]:overflow-y-auto max-[1100px]:fixed max-[1100px]:right-2.5 max-[1100px]:top-[calc(var(--titlebar-height)+0.625rem)] max-[1100px]:bottom-[calc(var(--statusbar-height)+0.625rem)] max-[1100px]:z-40 max-[1100px]:w-[min(360px,calc(100vw-5rem))] max-[1100px]:overflow-y-auto"
+>
+  <div
+    class="sticky -top-2.5 z-10 -mx-2.5 -mt-2.5 flex flex-wrap items-center justify-between gap-1.5 bg-bg-surface px-2.5 pt-2.5"
+  >
+    <h3 class="m-0 min-w-0 truncate font-display text-base text-text-primary">
+      {$tr("orderbook.title")}
+    </h3>
+    <div class="flex shrink-0 gap-1.5">
+      {#if currentSlug}
+        <button class="btn-secondary btn-sm whitespace-nowrap" on:click={refresh}
+          >{$tr("common.refresh")}</button
+        >
+        <button
+          class="btn-secondary btn-sm whitespace-nowrap"
+          data-orderbook-stats
+          on:click={openStats}>{$tr("browse.tabStatistics")}</button
+        >
+        <button
+          class="btn-secondary btn-sm whitespace-nowrap"
+          data-orderbook-wfm
+          on:click={openOnWarframeMarket}>{$tr("orderbook.openWfm")}</button
+        >
+      {/if}
+      {#if onClose}
+        <button
+          class="btn-secondary btn-sm !px-2"
+          data-orderbook-close
+          aria-label={$tr("orderbook.closeListings")}
+          title={$tr("common.close")}
+          on:click={onClose}>&times;</button
+        >
+      {/if}
+    </div>
+  </div>
+  {#if feedbackMessage}
+    <div class="inventory-orderbook-feedback">{feedbackMessage}</div>
+  {/if}
+
+  {#if !item}
+    <div
+      class="rounded-lg border border-dashed border-border bg-bg-soft px-2 py-2 text-xs text-text-secondary"
+    >
+      {$tr("orderbook.selectItemPrompt")}
+    </div>
+  {:else}
+    <div class="grid grid-cols-[52px_minmax(0,1fr)] gap-2 items-center">
+      <div
+        class="h-[52px] w-[52px] flex items-center justify-center rounded-lg border border-border bg-bg-raised overflow-hidden"
+      >
+        <ItemImage
+          src={item.displayImageUrl}
+          alt={itemLabel(item)}
+          auditKey={item.name}
+          cls="max-h-full max-w-full"
+        />
+      </div>
+      <div class="inventory-orderbook-item-meta">
+        <div class="flex min-w-0 items-center gap-2">
+          <div
+            class="font-display text-sm font-semibold text-text-primary overflow-hidden text-ellipsis whitespace-nowrap"
+          >
+            {itemLabel(item)}
+          </div>
+          {#if parentEntry?.name}
+            <button
+              type="button"
+              class="shrink-0 cursor-pointer rounded border border-border-subtle bg-transparent px-1.5 py-0.5 text-xs text-text-secondary transition-colors duration-150 hover:border-accent hover:text-accent"
+              title={$tr("common.open", { name: itemLabel(parentEntry) })}
+              on:click={openParentItem}
+            >
+              {$tr("common.partOf", { name: itemLabel(parentEntry) })}
+            </button>
+          {/if}
+        </div>
+        <div class="flex items-center justify-between gap-2 text-xs text-text-secondary">
+          <span class="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">
+            x{item.amount} · {item.categoryLabel}{#if requestRank != null}
+              {$tr("orderbook.viewingRank", { rank: requestRank })}{/if}
+          </span>
+          {#if orderBook && !loading && !errorMessage && !noData}
+            <span class="shrink-0 text-text-muted"
+              >{formatUpdatedLabel($tr, orderBook.timestamp ?? null, nowTimestamp)}</span
+            >
+          {/if}
+        </div>
+      </div>
+    </div>
+
+    {#if !currentSlug}
+      <div
+        class="rounded-lg border border-dashed border-border bg-bg-soft px-2 py-2 text-xs text-text-secondary"
+      >
+        {$tr("orderbook.noSlug")}
+      </div>
+    {:else if loading}
+      <div
+        class="rounded-lg border border-dashed border-border bg-bg-soft px-2 py-2 text-xs text-text-secondary"
+      >
+        {$tr("common.loadingListings")}
+      </div>
+    {:else if errorMessage}
+      <div
+        class="rounded-lg border border-dashed border-danger/40 bg-bg-soft px-2 py-2 text-xs text-danger"
+      >
+        {errorMessage}
+      </div>
+    {:else if noData || !orderBook}
+      <div
+        class="rounded-lg border border-dashed border-border bg-bg-soft px-2 py-2 text-xs text-text-secondary"
+      >
+        {$tr("orderbook.noActiveListings")}
+      </div>
+    {:else}
+      <div class="grid grid-cols-3 gap-1.5 max-[800px]:grid-cols-2">
+        <div class="grid gap-0.5 rounded-lg border border-border bg-bg-soft px-2 py-1.5">
+          <span class="text-xs uppercase tracking-[0.05em] text-text-muted"
+            >{$tr("orderbook.bestWts")}</span
+          >
+          <strong
+            class="font-display text-xs text-success"
+            data-orderbook-best-sell={bestSell != null ? formatUnitPlatinum(bestSell) : ""}
+            >{bestSell != null ? `${formatUnitPlatinum(bestSell)}p` : "-"}</strong
+          >
+        </div>
+        <div class="grid gap-0.5 rounded-lg border border-border bg-bg-soft px-2 py-1.5">
+          <span class="text-xs uppercase tracking-[0.05em] text-text-muted"
+            >{$tr("orderbook.bestWtb")}</span
+          >
+          <strong
+            class="font-display text-xs text-danger"
+            data-orderbook-best-buy={bestBuy != null ? formatUnitPlatinum(bestBuy) : ""}
+            >{bestBuy != null ? `${formatUnitPlatinum(bestBuy)}p` : "-"}</strong
+          >
+        </div>
+        <div class="grid gap-0.5 rounded-lg border border-border bg-bg-soft px-2 py-1.5">
+          <span class="text-xs uppercase tracking-[0.05em] text-text-muted"
+            >{$tr("orderbook.spread")}</span
+          >
+          <strong
+            class="font-display text-xs text-text-primary"
+            data-orderbook-spread={spread != null ? formatUnitPlatinum(spread) : ""}
+            >{spread != null ? `${formatUnitPlatinum(spread)}p` : "-"}</strong
+          >
+        </div>
+      </div>
+
+      <div
+        class="grid gap-1.5 rounded-lg border border-border bg-[color-mix(in_oklab,var(--bg-surface)_84%,var(--bg-raised))] p-2"
+      >
+        <label class="inline-flex items-center gap-1.5 text-xs text-text-secondary select-none">
+          <input type="checkbox" bind:checked={onlineIngameOnly} />
+          <span>{$tr("common.onlineInGameOnly")}</span>
+        </label>
+        <div class="grid gap-1.5">
+          {#if isRankedListingItem}
+            <label class="grid gap-1">
+              <span class="text-xs uppercase tracking-[0.05em] text-text-muted"
+                >{$tr("orderbook.rankView")}</span
+              >
+              <select class="inventory-orderbook-select" bind:value={selectedRank}>
+                {#each rankOptions as rankOption (rankOption)}
+                  <option value={rankOption}
+                    >{$tr("orderbook.rankOption", { rank: rankOption })}</option
+                  >
+                {/each}
+              </select>
+            </label>
+          {/if}
+          <div class="grid grid-cols-2 gap-1.5">
+            <label class="grid gap-1">
+              <span class="text-xs uppercase tracking-[0.05em] text-text-muted"
+                >{$tr("orderbook.wtsSort")}</span
+              >
+              <select class="inventory-orderbook-select" bind:value={sellSort}>
+                {#each SELL_SORT_OPTIONS as option (option.value)}
+                  <option value={option.value}>{$tr(option.labelKey)}</option>
+                {/each}
+              </select>
+            </label>
+            <label class="grid gap-1">
+              <span class="text-xs uppercase tracking-[0.05em] text-text-muted"
+                >{$tr("orderbook.wtbSort")}</span
+              >
+              <select class="inventory-orderbook-select" bind:value={buySort}>
+                {#each BUY_SORT_OPTIONS as option (option.value)}
+                  <option value={option.value}>{$tr(option.labelKey)}</option>
+                {/each}
+              </select>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-1.5 max-[800px]:grid-cols-1">
+        <button class="btn-success btn-sm" on:click={() => void openPostOrder("sell")}
+          >{$tr("common.postWts")}</button
+        >
+        <button class="btn-danger btn-sm" on:click={() => void openPostOrder("buy")}
+          >{$tr("common.postWtb")}</button
+        >
+      </div>
+
+      <div class="grid grid-cols-2 gap-2 max-[800px]:grid-cols-1">
+        <InventoryOrderBookSide
+          side="sell"
+          rows={sellRows}
+          hidden={hiddenSell}
+          {isRankedListingItem}
+          {sculpture}
+          {copyWhisper}
+          {openSellerProfile}
+        />
+        <InventoryOrderBookSide
+          side="buy"
+          rows={buyRows}
+          hidden={hiddenBuy}
+          {isRankedListingItem}
+          {sculpture}
+          {copyWhisper}
+          {openSellerProfile}
+        />
+      </div>
+    {/if}
+  {/if}
+</aside>
+
+{#if statsSlug}
+  <MarketStatsModal slug={statsSlug} title={statsTitle} onClose={closeStats} />
+{/if}
+
+<style>
+  .inventory-orderbook-panel {
+    --orderbook-pin-top: min(calc(var(--inventory-sticky-height, 0px) + 0.625rem), 45vh);
+  }
+  @media (min-width: 1101px) {
+    .inventory-orderbook-panel {
+      top: var(--orderbook-pin-top);
+      max-height: calc(
+        100vh - var(--titlebar-height) - var(--statusbar-height) - var(--orderbook-pin-top) -
+          0.625rem
+      );
+    }
+  }
+  .inventory-orderbook-feedback {
+    font-size: 0.76rem;
+    color: var(--accent-bright);
+    border: 1px solid color-mix(in oklab, var(--accent) 42%, transparent);
+    border-radius: var(--radius-md);
+    background: color-mix(in oklab, var(--accent) 14%, var(--bg-surface));
+    padding: 0.44rem 0.55rem;
+  }
+  .inventory-orderbook-select {
+    width: 100%;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-raised);
+    color: var(--text-primary);
+    padding: 0.26rem 0.34rem;
+    font-size: 0.72rem;
+  }
+  .inventory-orderbook-select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px color-mix(in oklab, var(--accent) 30%, transparent);
+  }
+</style>

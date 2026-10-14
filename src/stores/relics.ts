@@ -1,0 +1,51 @@
+import { derived, writable } from "svelte/store";
+import { readStorage, writeStorage } from "../lib/persistence.js";
+import { parseOwnedRelics } from "../lib/relic/relicInventory.js";
+import { inventoryData } from "./data.js";
+import {
+  DEFAULT_RELIC_PLANNER_FILTERS,
+  type RelicPlannerFilters,
+} from "../../config/shared/relicPlannerView.js";
+import type { OwnedCounts, RelicDatabase } from "../types/relics.js";
+
+export type {
+  RelicQualityMode,
+  RelicSortMode,
+  RelicVaultedMode,
+} from "../../config/shared/relicPlannerView.js";
+
+const RELIC_TAB_KEY = "wf_relics_tab";
+const RELIC_TABS = new Set(["all", "Lith", "Meso", "Neo", "Axi", "Requiem"]);
+
+function restoreRelicTab(): string {
+  const raw = readStorage(RELIC_TAB_KEY);
+  return raw && RELIC_TABS.has(raw) ? raw : "all";
+}
+
+export type RelicOwnershipMode = "owned" | "all";
+
+interface RelicViewState extends RelicPlannerFilters {
+  tierFilter: string;
+  ownershipMode: RelicOwnershipMode;
+}
+
+const DEFAULT_RELIC_VIEW_STATE: RelicViewState = {
+  ...DEFAULT_RELIC_PLANNER_FILTERS,
+  tierFilter: restoreRelicTab(),
+  ownershipMode: "owned",
+};
+
+export const relicDb = writable<RelicDatabase | null>(null);
+export const relicViewState = writable<RelicViewState>({ ...DEFAULT_RELIC_VIEW_STATE });
+export const relicOwnedCounts = derived(
+  [inventoryData, relicDb],
+  ([$inventoryData, $relicDb]): OwnedCounts => parseOwnedRelics($inventoryData, $relicDb),
+);
+export const relicEvRevision = writable<number>(0);
+
+export function setRelicFilter(patch: Partial<RelicViewState>): void {
+  if (patch.tierFilter && RELIC_TABS.has(patch.tierFilter)) {
+    writeStorage(RELIC_TAB_KEY, patch.tierFilter);
+  }
+  relicViewState.update((state) => ({ ...state, ...patch }));
+}

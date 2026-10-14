@@ -1,0 +1,941 @@
+<script lang="ts">
+  import { invoke } from "../../../lib/ipc.js";
+  import { tr, type MessageKey } from "../../../lib/i18n.js";
+  import { parsedItems, wfmItems } from "../../../stores/data.js";
+  import { savedSelections } from "../../../stores/inventorySelection.js";
+  import { ownedCountForAlertItem } from "../../../lib/marketAlerts/ownedCount.js";
+  import { inputText, numOrUndef } from "../../../lib/numberInput.js";
+  import { getAlertSellLink, setAlertSellLink } from "./alertBulkSell.js";
+  import { statLabel } from "./alertResolve.js";
+  import ThemedInput from "../../ThemedInput.svelte";
+  import { titleFromSlug } from "../../../../config/shared/wfm.js";
+  import {
+    MARKET_ALERT_DEFAULT_COOLDOWN_MINUTES,
+    MARKET_ALERT_MAX_ATTRIBUTES,
+    MARKET_ALERT_MAX_COOLDOWN_MINUTES,
+    MARKET_ALERT_MAX_NAME_CHARS,
+    MARKET_ALERT_MAX_STAT_BOUNDS,
+    MARKET_ALERT_MIN_COOLDOWN_MINUTES,
+    MARKET_ALERT_SELLER_STATUSES,
+    MARKET_ORDER_SIDES,
+    RIVEN_POLARITIES,
+  } from "../../../../config/shared/marketAlertTypes.js";
+  import type {
+    ItemAlertMatch,
+    MarketAlertBinding,
+    MarketAlertRule,
+    MarketAlertRuleInput,
+    MarketAlertSavePayload,
+    MarketAlertSellerStatus,
+    RivenAlertMatch,
+    RivenPolarity,
+    RivenStatBound,
+  } from "../../../../config/shared/marketAlertTypes.js";
+  import type {
+    RivenGoodRollAttribute,
+    RivenGoodRollGroup,
+    RivenStatOption,
+  } from "../../../types/ipc.js";
+  import type { WfmSearchItem } from "../../../types/market.js";
+
+  /** How traders write a roll's shape: p is a buff, n the curse. */
+  type StatLayout = "" | "2p1n" | "3p1n" | "2p" | "3p";
+
+  let {
+    rule = null,
+    binding = null,
+    statOptions = [],
+    cooldownLeftMs = 0,
+    onClearCooldown,
+    onClose,
+  }: {
+    rule?: MarketAlertRule | null;
+    binding?: MarketAlertBinding | null;
+    statOptions?: RivenStatOption[];
+    cooldownLeftMs?: number;
+    onClearCooldown?: (rule: MarketAlertRule) => void;
+    onClose: (saved: boolean) => void;
+  } = $props();
+
+  const cooldownLeftMinutes = $derived(Math.ceil(cooldownLeftMs / 60_000));
+
+  // svelte-ignore state_referenced_locally
+  const initialRule = rule;
+  // svelte-ignore state_referenced_locally
+  const initialBinding = binding;
+  const riven: RivenAlertMatch | null = initialRule?.riven ?? null;
+  const item: ItemAlertMatch | null = initialRule?.item ?? null;
+
+  let kind = $state<"riven" | "item">(initialRule?.kind === "item" ? "item" : "riven");
+  let name = $state(initialRule?.name ?? "");
+  let cooldownMinutes = $state(
+    initialRule?.cooldownMinutes ?? MARKET_ALERT_DEFAULT_COOLDOWN_MINUTES,
+  );
+  let noCooldown = $state(initialRule?.noCooldown === true);
+  let native = $state(initialBinding?.native !== false);
+  let enabled = $state(initialRule?.enabled !== false);
+  let error = $state<{ key: MessageKey; params?: Record<string, string> } | null>(null);
+  let saving = $state(false);
+
+  const existingWeaponSlug = riven?.weaponUrlName ?? "";
+  let weaponInput = $state(existingWeaponSlug ? titleFromSlug(existingWeaponSlug) : "");
+  let weaponDirty = $state(false);
+  let requirePositive = $state<string[]>([...(riven?.requirePositive ?? [])]);
+  let allowedNegatives = $state<string[]>([...(riven?.allowedNegatives ?? [])]);
+  let excludeNegatives = $state<string[]>([...(riven?.excludeNegatives ?? [])]);
+  let excludeAttributes = $state<string[]>([...(riven?.excludeAttributes ?? [])]);
+  let statBounds = $state<Array<{ attribute: string; min: string; max: string }>>(
+    (riven?.statBounds ?? []).map((b) => ({
+      attribute: b.attribute,
+      min: b.min !== undefined ? String(b.min) : "",
+      max: b.max !== undefined ? String(b.max) : "",
+    })),
+  );
+  let negativeMode = $state<"any" | "required" | "forbidden">(
+    riven?.hasNegative === true ? "required" : riven?.hasNegative === false ? "forbidden" : "any",
+  );
+  let statLayout = $state<StatLayout>(layoutFromMatch(riven));
+  let positiveCount = $state<number | null>(riven?.positiveCount ?? null);
+  let similarityPct = $state(
+    riven?.minSimilarityPct !== undefined ? String(riven.minSimilarityPct) : "",
+  );
+  let includeBidOnly = $state(riven?.includeBidOnly === true);
+  let minMastery = $state(riven?.minMasteryRank !== undefined ? String(riven.minMasteryRank) : "");
+  let maxMastery = $state(riven?.maxMasteryRank !== undefined ? String(riven.maxMasteryRank) : "");
+  let polarity = $state<string>(riven?.polarity ?? "");
+  let minModRank = $state(riven?.minModRank !== undefined ? String(riven.minModRank) : "");
+  let maxModRank = $state(riven?.maxModRank !== undefined ? String(riven.maxModRank) : "");
+  let minPlat = $state(
+    riven?.minPlatinum !== undefined
+      ? String(riven.minPlatinum)
+      : item?.minPlatinum !== undefined
+        ? String(item.minPlatinum)
+        : "",
+  );
+  let maxPlat = $state(
+    riven?.maxPlatinum !== undefined
+      ? String(riven.maxPlatinum)
+      : item?.maxPlatinum !== undefined
+        ? String(item.maxPlatinum)
+        : "",
+  );
+  let minRerolls = $state(riven?.minRerolls !== undefined ? String(riven.minRerolls) : "");
+  let maxRerolls = $state(riven?.maxRerolls !== undefined ? String(riven.maxRerolls) : "");
+  let minEndoPerPlat = $state(
+    riven?.minEndoPerPlat !== undefined ? String(riven.minEndoPerPlat) : "",
+  );
+  let rivenStatuses = $state<MarketAlertSellerStatus[]>([...(riven?.statuses ?? [])]);
+
+  let itemSlug = $state(item?.itemUrlName ?? "");
+  let itemLabel = $state(item ? titleFromSlug(item.itemUrlName) : "");
+  let itemQuery = $state("");
+  let itemResults = $state<WfmSearchItem[]>([]);
+  let side = $state<"sell" | "buy">(item?.side ?? "sell");
+  let minQuantity = $state(item?.minQuantity !== undefined ? String(item.minQuantity) : "");
+  let statuses = $state<MarketAlertSellerStatus[]>([...(item?.statuses ?? ["ingame"])]);
+  let ownedBelow = $state(item?.ownedBelow !== undefined ? String(item.ownedBelow) : "");
+  let ownedAbove = $state(item?.ownedAbove !== undefined ? String(item.ownedAbove) : "");
+
+  let sellLink = $state(initialRule?.id ? getAlertSellLink(initialRule.id) : "");
+  const sellLinkOptions = $derived(
+    sellLink && !$savedSelections.some((entry) => entry.name === sellLink)
+      ? [sellLink, ...$savedSelections.map((entry) => entry.name)]
+      : $savedSelections.map((entry) => entry.name),
+  );
+
+  let weaponNames = $state<string[]>([]);
+
+  // One bound per attribute: the rule parser keeps only the first bound on a stat.
+  const nextFreeBoundAttribute = $derived(
+    statOptions.find((option) => !statBounds.some((row) => row.attribute === option.wfmUrlName))
+      ?.wfmUrlName ?? null,
+  );
+
+  function layoutFromMatch(saved: RivenAlertMatch | null): StatLayout {
+    if (saved?.positiveCount !== 2 && saved?.positiveCount !== 3) return "";
+    if (saved.hasNegative === true) return saved.positiveCount === 2 ? "2p1n" : "3p1n";
+    if (saved.hasNegative === false) return saved.positiveCount === 2 ? "2p" : "3p";
+    return "";
+  }
+
+  function applyStatLayout(): void {
+    positiveCount = statLayout ? (statLayout.startsWith("3") ? 3 : 2) : null;
+    if (!statLayout) return;
+    negativeMode = statLayout.endsWith("n") ? "required" : "forbidden";
+  }
+
+  const MASTERY_RANK_BOUNDS = { min: 0, max: 16 };
+  const MOD_RANK_BOUNDS = { min: 0, max: 8 };
+
+  function addStatBound(): void {
+    const attribute = nextFreeBoundAttribute;
+    if (!attribute) return;
+    statBounds = [...statBounds, { attribute, min: "", max: "" }];
+  }
+
+  let godRollGroups = $state<RivenGoodRollGroup[]>([]);
+  let godRollNegatives = $state<RivenGoodRollAttribute[]>([]);
+  let godRollOptional = $state<string[]>([]);
+  let godRollSkipped = $state<string[]>([]);
+  let godRollPicking = $state(false);
+  let godRollBusy = $state(false);
+  let godRollNote = $state<MessageKey | null>(null);
+
+  const sectionTitle =
+    "m-0 font-display text-[0.7rem] font-bold uppercase tracking-[0.09em] text-text-muted";
+
+  $effect(() => {
+    void invoke("getRivenWeaponNames", true).then((names) => {
+      weaponNames = names;
+    });
+  });
+
+  let searchToken = 0;
+  async function searchItems(): Promise<void> {
+    const query = itemQuery.trim();
+    if (query.length < 3) {
+      itemResults = [];
+      return;
+    }
+    const token = ++searchToken;
+    const results = await invoke("wfmSearchItems", query, 8);
+    // The search invoke can answer with a WfmMutationError object instead.
+    if (token === searchToken && Array.isArray(results)) itemResults = results;
+  }
+
+  function pickItem(entry: WfmSearchItem): void {
+    if (!entry.url_name) return;
+    itemSlug = entry.url_name;
+    itemLabel = entry.item_name;
+    itemResults = [];
+    itemQuery = "";
+  }
+
+  function toggleStatus(
+    list: readonly MarketAlertSellerStatus[],
+    status: MarketAlertSellerStatus,
+  ): MarketAlertSellerStatus[] {
+    return list.includes(status) ? list.filter((s) => s !== status) : [...list, status];
+  }
+
+  function urlNames(attributes: RivenGoodRollAttribute[]): string[] {
+    const out: string[] = [];
+    for (const attribute of attributes) {
+      if (!attribute.wfmUrlName || out.includes(attribute.wfmUrlName)) continue;
+      if (out.length >= MARKET_ALERT_MAX_ATTRIBUTES) break;
+      out.push(attribute.wfmUrlName);
+    }
+    return out;
+  }
+
+  function applyGodRoll(index: number): void {
+    const group = godRollGroups[index];
+    if (!group) return;
+    requirePositive = urlNames(group.mandatory);
+    allowedNegatives = urlNames(godRollNegatives);
+    godRollOptional = group.optional.map((attribute) => attribute.displayName);
+    godRollSkipped = [...group.mandatory, ...godRollNegatives]
+      .filter((attribute) => !attribute.wfmUrlName)
+      .map((attribute) => attribute.displayName);
+    godRollPicking = false;
+  }
+
+  async function loadGodRoll(): Promise<void> {
+    const weapon = weaponDirty || !existingWeaponSlug ? weaponInput.trim() : existingWeaponSlug;
+    if (!weapon) {
+      error = { key: "marketAlerts.weaponRequired" };
+      return;
+    }
+    godRollBusy = true;
+    godRollNote = null;
+    try {
+      const detail = await invoke("getRivenGoodRoll", weapon);
+      godRollGroups = detail?.groups ?? [];
+      godRollNegatives = detail?.acceptedNegatives ?? [];
+      if (godRollGroups.length === 0) {
+        godRollNote = "marketAlerts.godRollMissing";
+        return;
+      }
+      if (godRollGroups.length === 1) applyGodRoll(0);
+      else godRollPicking = true;
+    } finally {
+      godRollBusy = false;
+    }
+  }
+
+  function buildRivenMatch(): RivenAlertMatch | null {
+    if (!existingWeaponSlug && !weaponInput.trim()) {
+      error = { key: "marketAlerts.weaponRequired" };
+      return null;
+    }
+    const bounds: RivenStatBound[] = [];
+    for (const row of statBounds) {
+      if (!row.attribute) continue;
+      const min = numOrUndef(row.min);
+      const max = numOrUndef(row.max);
+      if (min === undefined && max === undefined) continue;
+      const bound: RivenStatBound = { attribute: row.attribute };
+      if (min !== undefined) bound.min = min;
+      if (max !== undefined) bound.max = max;
+      bounds.push(bound);
+    }
+    const match: RivenAlertMatch = {
+      weaponUrlName: existingWeaponSlug,
+      requirePositive,
+      excludeAttributes,
+      statBounds: bounds,
+    };
+    if (rivenStatuses.length > 0) match.statuses = rivenStatuses;
+    if (allowedNegatives.length > 0) match.allowedNegatives = allowedNegatives;
+    if (excludeNegatives.length > 0) match.excludeNegatives = excludeNegatives;
+    if (negativeMode === "required") match.hasNegative = true;
+    if (negativeMode === "forbidden") match.hasNegative = false;
+    if (positiveCount !== null) match.positiveCount = positiveCount;
+    if (includeBidOnly) match.includeBidOnly = true;
+    const optional: Array<[keyof RivenAlertMatch, number | undefined]> = [
+      ["minSimilarityPct", numOrUndef(similarityPct)],
+      ["minMasteryRank", numOrUndef(minMastery)],
+      ["maxMasteryRank", numOrUndef(maxMastery)],
+      ["minModRank", numOrUndef(minModRank)],
+      ["maxModRank", numOrUndef(maxModRank)],
+      ["minPlatinum", numOrUndef(minPlat)],
+      ["maxPlatinum", numOrUndef(maxPlat)],
+      ["minRerolls", numOrUndef(minRerolls)],
+      ["maxRerolls", numOrUndef(maxRerolls)],
+      ["minEndoPerPlat", numOrUndef(minEndoPerPlat)],
+    ];
+    for (const [key, value] of optional) {
+      if (value !== undefined) (match as unknown as Record<string, number>)[key] = value;
+    }
+    if (polarity) match.polarity = polarity as RivenPolarity;
+    return match;
+  }
+
+  function buildItemMatch(): ItemAlertMatch | null {
+    if (!itemSlug) {
+      error = { key: "marketAlerts.itemRequired" };
+      return null;
+    }
+    const match: ItemAlertMatch = { itemUrlName: itemSlug, side, statuses };
+    const optional: Array<[keyof ItemAlertMatch, number | undefined]> = [
+      ["minPlatinum", numOrUndef(minPlat)],
+      ["maxPlatinum", numOrUndef(maxPlat)],
+      ["minQuantity", numOrUndef(minQuantity)],
+      ["ownedBelow", numOrUndef(ownedBelow)],
+      ["ownedAbove", numOrUndef(ownedAbove)],
+    ];
+    for (const [key, value] of optional) {
+      if (value !== undefined) (match as unknown as Record<string, number>)[key] = value;
+    }
+    if (match.minPlatinum === undefined && match.maxPlatinum === undefined) {
+      error = { key: "marketAlerts.priceRequired" };
+      return null;
+    }
+    return match;
+  }
+
+  async function save(): Promise<void> {
+    error = null;
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      error = { key: "marketAlerts.nameRequired" };
+      return;
+    }
+    const input: MarketAlertRuleInput = {
+      name: trimmedName,
+      kind,
+      enabled,
+      cooldownMinutes: Number(cooldownMinutes) || MARKET_ALERT_DEFAULT_COOLDOWN_MINUTES,
+      noCooldown,
+    };
+    if (rule?.id) input.id = rule.id;
+    if (kind === "riven") {
+      const match = buildRivenMatch();
+      if (!match) return;
+      input.riven = match;
+    } else {
+      const match = buildItemMatch();
+      if (!match) return;
+      input.item = match;
+    }
+
+    const payload: MarketAlertSavePayload = { rule: input, binding: { native } };
+    if (kind === "riven" && (weaponDirty || !existingWeaponSlug)) {
+      payload.weaponName = weaponInput.trim();
+    }
+    if (kind === "item" && itemSlug) {
+      payload.ownedCount = ownedCountForAlertItem(
+        itemSlug,
+        itemLabel || titleFromSlug(itemSlug),
+        $parsedItems,
+        $wfmItems,
+      );
+    }
+
+    saving = true;
+    try {
+      // $state arrays are proxies and proxies fail the IPC structured clone.
+      const result = await invoke("marketAlertsSave", $state.snapshot(payload));
+      if (!result.ok) {
+        error = { key: "marketAlerts.saveFailed", params: { error: result.error } };
+        return;
+      }
+      if (kind === "item") setAlertSellLink(result.rule.id, sellLink);
+      onClose(true);
+    } finally {
+      saving = false;
+    }
+  }
+</script>
+
+{#snippet statPicker(
+  labelKey: MessageKey,
+  list: string[],
+  set: (next: string[]) => void,
+  hintKey?: MessageKey,
+)}
+  <div class="text-sm">
+    <span class="text-text-secondary">{$tr(labelKey)}</span>
+    {#if hintKey}
+      <span class="ml-2 text-xs text-text-muted">{$tr(hintKey)}</span>
+    {/if}
+    <div class="mt-1 flex flex-wrap items-center gap-1.5">
+      {#each list as stat (stat)}
+        <span class="flex items-center gap-1 rounded-full border border-border px-2 py-0.5">
+          {statLabel(stat, statOptions)}
+          <button
+            class="link-btn"
+            aria-label={$tr("common.delete")}
+            onclick={() => set(list.filter((s) => s !== stat))}>x</button
+          >
+        </span>
+      {/each}
+      {#if list.length < MARKET_ALERT_MAX_ATTRIBUTES}
+        <select
+          class="shared-filter-select"
+          value=""
+          onchange={(event) => {
+            const next = event.currentTarget.value;
+            if (next && !list.includes(next)) set([...list, next]);
+            event.currentTarget.value = "";
+          }}
+        >
+          <option value="">+</option>
+          {#each statOptions as option (option.wfmUrlName)}
+            {#if !list.includes(option.wfmUrlName)}
+              <option value={option.wfmUrlName}>{option.displayName}</option>
+            {/if}
+          {/each}
+        </select>
+      {/if}
+    </div>
+  </div>
+{/snippet}
+
+{#snippet sellerStatusPicker(
+  list: MarketAlertSellerStatus[],
+  set: (next: MarketAlertSellerStatus[]) => void,
+  scope: string,
+)}
+  <div class="flex flex-col gap-1 text-sm" data-alert-seller-status={scope}>
+    <span class="text-text-secondary">{$tr("marketAlerts.sellerStatus")}</span>
+    <div class="flex flex-wrap gap-x-3 gap-y-1">
+      <label class="flex items-center gap-1">
+        <input
+          type="checkbox"
+          data-status="all"
+          checked={list.length === 0}
+          onchange={(event) => {
+            // A click on a ticked All would untick it, but the empty list still means any seller.
+            event.currentTarget.checked = true;
+            set([]);
+          }}
+        />
+        {$tr("common.all")}
+      </label>
+      {#each MARKET_ALERT_SELLER_STATUSES as status (status)}
+        <label class="flex items-center gap-1">
+          <input
+            type="checkbox"
+            data-status={status}
+            checked={list.includes(status)}
+            onchange={() => set(toggleStatus(list, status))}
+          />
+          {status === "ingame" ? $tr("common.inGame") : $tr("common.online")}
+        </label>
+      {/each}
+    </div>
+  </div>
+{/snippet}
+
+{#snippet rangePair(
+  labelKey: MessageKey,
+  lo: { v: string },
+  hi: { v: string },
+  bounds?: { min: number; max: number },
+)}
+  <div class="flex flex-col gap-1 text-sm">
+    <span class="text-text-secondary">{$tr(labelKey)}</span>
+    <div class="flex gap-1">
+      <ThemedInput
+        bind:value={lo.v}
+        type={bounds ? "number" : "text"}
+        min={bounds?.min ?? null}
+        max={bounds?.max ?? null}
+        clampToRange={!!bounds}
+        placeholder={$tr("common.min")}
+        className="w-full"
+      />
+      <ThemedInput
+        bind:value={hi.v}
+        type={bounds ? "number" : "text"}
+        min={bounds?.min ?? null}
+        max={bounds?.max ?? null}
+        clampToRange={!!bounds}
+        placeholder={$tr("common.max")}
+        className="w-full"
+      />
+    </div>
+  </div>
+{/snippet}
+
+<div class="rounded-xl border border-border bg-bg-surface p-4" data-testid="alert-rule-editor">
+  <div class="mb-3 flex items-center justify-between">
+    <h3 class="m-0 font-display text-lg font-bold">
+      {rule ? $tr("marketAlerts.editRule") : $tr("marketAlerts.newRule")}
+    </h3>
+    {#if !rule}
+      <div class="flex gap-1">
+        <button
+          class={kind === "riven" ? "btn-primary btn-sm" : "btn-secondary btn-sm"}
+          onclick={() => (kind = "riven")}>{$tr("rivens.type.riven")}</button
+        >
+        <button
+          class={kind === "item" ? "btn-primary btn-sm" : "btn-secondary btn-sm"}
+          onclick={() => (kind = "item")}>{$tr("common.item")}</button
+        >
+      </div>
+    {/if}
+  </div>
+
+  <section class="flex flex-col gap-3" data-alert-section="watch">
+    <h4 class={sectionTitle}>{$tr("marketAlerts.section.watch")}</h4>
+    <div class="grid gap-3 md:grid-cols-2">
+      <label class="flex flex-col gap-1 text-sm">
+        <span class="text-text-secondary">{$tr("marketAlerts.ruleName")}</span>
+        <ThemedInput bind:value={name} placeholder={$tr("marketAlerts.ruleName")} />
+      </label>
+      {#if kind === "riven"}
+        <label class="flex flex-col gap-1 text-sm">
+          <span class="text-text-secondary">{$tr("rivens.finder.weapon")}</span>
+          <input
+            class="rounded-[var(--radius-md)] border border-[color:var(--ui-control-border)] bg-[var(--ui-control-bg)] px-2.5 py-2 text-sm text-text-primary outline-none"
+            list="market-alert-weapon-names"
+            data-search-focus
+            maxlength={MARKET_ALERT_MAX_NAME_CHARS * 2}
+            bind:value={weaponInput}
+            oninput={() => (weaponDirty = true)}
+          />
+          <datalist id="market-alert-weapon-names">
+            {#each weaponNames as weaponName (weaponName)}
+              <option value={weaponName}></option>
+            {/each}
+          </datalist>
+        </label>
+      {:else}
+        <div class="flex flex-col gap-1 text-sm">
+          <span class="text-text-secondary">{$tr("common.item")}</span>
+          {#if itemSlug}
+            <div class="flex items-center gap-2">
+              <span class="rounded-full border border-border px-2 py-0.5">{itemLabel}</span>
+              <button
+                class="link-btn"
+                onclick={() => {
+                  itemSlug = "";
+                  itemLabel = "";
+                }}>{$tr("common.delete")}</button
+              >
+            </div>
+          {:else}
+            <ThemedInput
+              bind:value={itemQuery}
+              placeholder={$tr("common.searchPlaceholder")}
+              searchFocusTarget
+              onInput={() => void searchItems()}
+            />
+            {#if itemResults.length > 0}
+              <div class="flex flex-col rounded border border-border bg-bg-surface">
+                {#each itemResults as result (result.id)}
+                  <button class="link-btn px-2 py-1 text-left" onclick={() => pickItem(result)}>
+                    {result.item_name}
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          {/if}
+        </div>
+        <label class="flex flex-col gap-1 text-sm">
+          <span class="text-text-secondary">{$tr("common.orderType")}</span>
+          <select class="shared-filter-select" bind:value={side}>
+            {#each MARKET_ORDER_SIDES as orderSide (orderSide)}
+              <option value={orderSide}>
+                {orderSide === "sell" ? $tr("market.tab.sell") : $tr("market.tab.buy")}
+              </option>
+            {/each}
+          </select>
+        </label>
+      {/if}
+    </div>
+  </section>
+
+  <section
+    class="mt-4 flex flex-col gap-3 border-t border-border-subtle pt-3.5"
+    data-alert-section="filters"
+  >
+    <h4 class={sectionTitle}>{$tr("common.filters")}</h4>
+
+    {#if kind === "riven"}
+      <div class="grid gap-3 md:grid-cols-2">
+        <label class="flex flex-col gap-1 text-sm">
+          <span class="text-text-secondary">{$tr("marketAlerts.negative")}</span>
+          <select class="shared-filter-select" data-alert-negative-mode bind:value={negativeMode}>
+            <option value="any">{$tr("filters.any")}</option>
+            <option value="required">{$tr("marketAlerts.negativeRequired")}</option>
+            <option value="forbidden">{$tr("marketAlerts.negativeForbidden")}</option>
+          </select>
+        </label>
+        <label class="flex flex-col gap-1 text-sm">
+          <span class="text-text-secondary">{$tr("marketAlerts.statLayout")}</span>
+          <select
+            class="shared-filter-select"
+            data-alert-stat-layout
+            bind:value={statLayout}
+            onchange={applyStatLayout}
+          >
+            <option value="">{$tr("filters.any")}</option>
+            <option value="2p1n">2p1n</option>
+            <option value="3p1n">3p1n</option>
+            <option value="2p">2p</option>
+            <option value="3p">3p</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-2">
+        <button
+          class="btn-secondary btn-sm"
+          disabled={godRollBusy}
+          data-riven-godroll-prefill
+          onclick={() => void loadGodRoll()}>{$tr("marketAlerts.useGodRoll")}</button
+        >
+        {#if godRollNote}
+          <span class="text-xs text-text-muted" data-riven-godroll-note>{$tr(godRollNote)}</span>
+        {/if}
+      </div>
+
+      {#if godRollPicking}
+        <div
+          class="flex flex-col gap-1 rounded-[var(--radius-md)] border border-border p-2"
+          data-riven-godroll-groups
+        >
+          <span class="text-xs text-text-secondary">{$tr("marketAlerts.godRollPickGroup")}</span>
+          {#each godRollGroups as group, index (index)}
+            <button
+              class="link-btn text-left text-xs"
+              data-riven-godroll-group={index}
+              onclick={() => applyGodRoll(index)}
+            >
+              {index + 1}. {group.mandatory.map((attribute) => attribute.displayName).join(" + ")}
+            </button>
+          {/each}
+        </div>
+      {/if}
+
+      {#if godRollOptional.length > 0}
+        <span class="text-xs text-text-muted" data-riven-godroll-optional>
+          {$tr("marketAlerts.godRollOptional", { stats: godRollOptional.join(", ") })}
+        </span>
+      {/if}
+      {#if godRollSkipped.length > 0}
+        <span class="text-xs text-warning" data-riven-godroll-skipped>
+          {$tr("marketAlerts.godRollSkipped", { stats: godRollSkipped.join(", ") })}
+        </span>
+      {/if}
+
+      {@render statPicker("marketAlerts.requiredPositive", requirePositive, (next) => {
+        requirePositive = next;
+      })}
+      {@render statPicker("marketAlerts.allowedNegatives", allowedNegatives, (next) => {
+        allowedNegatives = next;
+      })}
+      {@render statPicker(
+        "marketAlerts.excludedNegatives",
+        excludeNegatives,
+        (next) => {
+          excludeNegatives = next;
+        },
+        "marketAlerts.excludedNegativesHint",
+      )}
+      {@render statPicker(
+        "marketAlerts.excludedStats",
+        excludeAttributes,
+        (next) => {
+          excludeAttributes = next;
+        },
+        "marketAlerts.excludedStatsHint",
+      )}
+
+      <div class="text-sm">
+        <span class="text-text-secondary">{$tr("marketAlerts.statBounds")}</span>
+        <span class="ml-2 text-xs text-text-muted">{$tr("marketAlerts.statBoundsMaxRank")}</span>
+        {#each statBounds as bound, index (index)}
+          <div class="mt-1 flex items-center gap-2">
+            <select class="shared-filter-select" bind:value={bound.attribute}>
+              {#each statOptions as option (option.wfmUrlName)}
+                <option value={option.wfmUrlName}>{option.displayName}</option>
+              {/each}
+            </select>
+            <ThemedInput bind:value={bound.min} placeholder={$tr("common.min")} className="w-24" />
+            <ThemedInput bind:value={bound.max} placeholder={$tr("common.max")} className="w-24" />
+            <button
+              class="link-btn"
+              onclick={() => (statBounds = statBounds.filter((_row, i) => i !== index))}
+              >{$tr("common.delete")}</button
+            >
+          </div>
+        {/each}
+        {#if statBounds.length < MARKET_ALERT_MAX_STAT_BOUNDS && nextFreeBoundAttribute}
+          <button class="link-btn mt-1" onclick={addStatBound}
+            >{$tr("marketAlerts.addBound")}</button
+          >
+        {/if}
+      </div>
+
+      <div class="grid gap-3 md:grid-cols-3">
+        <label class="flex flex-col gap-1 text-sm">
+          <span class="text-text-secondary">{$tr("marketAlerts.similarity")}</span>
+          <ThemedInput type="number" min="0" max="100" bind:value={similarityPct} />
+        </label>
+        <label class="flex flex-col gap-1 text-sm">
+          <span class="text-text-secondary">{$tr("marketAlerts.polarity")}</span>
+          <select class="shared-filter-select" bind:value={polarity}>
+            <option value="">{$tr("filters.any")}</option>
+            {#each RIVEN_POLARITIES as pol (pol)}
+              <option value={pol}>{pol}</option>
+            {/each}
+          </select>
+        </label>
+        <label class="flex flex-col gap-1 text-sm">
+          <span class="text-text-secondary">{$tr("marketAlerts.minEndoPerPlat")}</span>
+          <ThemedInput type="number" min="0" bind:value={minEndoPerPlat} />
+        </label>
+        {@render sellerStatusPicker(
+          rivenStatuses,
+          (next) => {
+            rivenStatuses = next;
+          },
+          "riven",
+        )}
+      </div>
+      <label class="flex items-center gap-1.5 text-sm">
+        <input type="checkbox" bind:checked={includeBidOnly} />
+        {$tr("marketAlerts.includeBidOnly")}
+      </label>
+
+      <div class="grid gap-3 md:grid-cols-4">
+        {@render rangePair(
+          "marketAlerts.masteryRank",
+          {
+            get v() {
+              return minMastery;
+            },
+            set v(next: string) {
+              minMastery = inputText(next);
+            },
+          },
+          {
+            get v() {
+              return maxMastery;
+            },
+            set v(next: string) {
+              maxMastery = inputText(next);
+            },
+          },
+          MASTERY_RANK_BOUNDS,
+        )}
+        {@render rangePair(
+          "common.rank",
+          {
+            get v() {
+              return minModRank;
+            },
+            set v(next: string) {
+              minModRank = inputText(next);
+            },
+          },
+          {
+            get v() {
+              return maxModRank;
+            },
+            set v(next: string) {
+              maxModRank = inputText(next);
+            },
+          },
+          MOD_RANK_BOUNDS,
+        )}
+        {@render rangePair(
+          "common.platinum",
+          {
+            get v() {
+              return minPlat;
+            },
+            set v(next: string) {
+              minPlat = next;
+            },
+          },
+          {
+            get v() {
+              return maxPlat;
+            },
+            set v(next: string) {
+              maxPlat = next;
+            },
+          },
+        )}
+        {@render rangePair(
+          "common.rerolls",
+          {
+            get v() {
+              return minRerolls;
+            },
+            set v(next: string) {
+              minRerolls = next;
+            },
+          },
+          {
+            get v() {
+              return maxRerolls;
+            },
+            set v(next: string) {
+              maxRerolls = next;
+            },
+          },
+        )}
+      </div>
+    {:else}
+      <div class="grid gap-3 md:grid-cols-3">
+        <label class="flex flex-col gap-1 text-sm">
+          <span class="text-text-secondary">{$tr("common.min")} {$tr("common.platinum")}</span>
+          <ThemedInput type="number" min="0" bind:value={minPlat} />
+        </label>
+        <label class="flex flex-col gap-1 text-sm">
+          <span class="text-text-secondary">{$tr("common.max")} {$tr("common.platinum")}</span>
+          <ThemedInput type="number" min="0" bind:value={maxPlat} />
+        </label>
+        <label class="flex flex-col gap-1 text-sm">
+          <span class="text-text-secondary">{$tr("marketAlerts.minQuantity")}</span>
+          <ThemedInput type="number" min="1" bind:value={minQuantity} />
+        </label>
+      </div>
+
+      <div class="grid gap-3 md:grid-cols-3">
+        {@render sellerStatusPicker(
+          statuses,
+          (next) => {
+            statuses = next;
+          },
+          "item",
+        )}
+        <label class="flex flex-col gap-1 text-sm">
+          <span class="text-text-secondary">{$tr("marketAlerts.ownedBelow")}</span>
+          <ThemedInput type="number" min="0" bind:value={ownedBelow} />
+        </label>
+        <label class="flex flex-col gap-1 text-sm">
+          <span class="text-text-secondary">{$tr("marketAlerts.ownedAbove")}</span>
+          <ThemedInput type="number" min="0" bind:value={ownedAbove} />
+        </label>
+      </div>
+    {/if}
+  </section>
+
+  <section
+    class="mt-4 flex flex-col gap-3 border-t border-border-subtle pt-3.5"
+    data-alert-section="delivery"
+  >
+    <h4 class={sectionTitle}>{$tr("marketAlerts.section.delivery")}</h4>
+    <div class="grid gap-3 md:grid-cols-2">
+      <div class="flex flex-col gap-1">
+        <label class="flex flex-col gap-1 text-sm">
+          <span class="text-text-secondary">{$tr("marketAlerts.cooldownMinutes")}</span>
+          <ThemedInput
+            type="number"
+            min={MARKET_ALERT_MIN_COOLDOWN_MINUTES}
+            max={MARKET_ALERT_MAX_COOLDOWN_MINUTES}
+            disabled={noCooldown}
+            bind:value={cooldownMinutes}
+          />
+          <span class="text-xs text-text-muted" data-alert-cooldown-hint>
+            {$tr("marketAlerts.cooldownHint", {
+              min: MARKET_ALERT_MIN_COOLDOWN_MINUTES,
+              max: MARKET_ALERT_MAX_COOLDOWN_MINUTES,
+            })}
+          </span>
+          {#if initialRule && onClearCooldown}
+            <span class="flex items-center gap-2">
+              <button
+                type="button"
+                class="btn-secondary btn-sm"
+                disabled={cooldownLeftMs <= 0 || noCooldown}
+                data-alert-editor-clear-cooldown
+                onclick={() => onClearCooldown(initialRule)}
+                >{$tr("marketAlerts.clearCooldown")}</button
+              >
+              {#if cooldownLeftMs > 0}
+                <span class="text-xs text-text-muted" data-alert-editor-cooldown-left
+                  >{$tr("marketAlerts.cooldownLeft", { minutes: cooldownLeftMinutes })}</span
+                >
+              {/if}
+            </span>
+          {/if}
+        </label>
+        <label class="flex items-center gap-1.5 text-sm">
+          <input type="checkbox" data-alert-no-cooldown-editor bind:checked={noCooldown} />
+          {$tr("marketAlerts.noCooldown")}
+        </label>
+        <span class="text-xs text-text-muted">{$tr("marketAlerts.noCooldownHint")}</span>
+      </div>
+      {#if kind === "item"}
+        <label class="flex flex-col gap-1 text-sm">
+          <span class="text-text-secondary">{$tr("marketAlerts.sellSelection")}</span>
+          <select class="shared-filter-select" data-alert-sell-link bind:value={sellLink}>
+            <option value="">{$tr("marketAlerts.sellSelectionItem")}</option>
+            {#each sellLinkOptions as selectionName (selectionName)}
+              <option value={selectionName}>{selectionName}</option>
+            {/each}
+          </select>
+        </label>
+      {/if}
+    </div>
+    <div class="flex flex-wrap items-center gap-4 text-sm">
+      <label class="flex items-center gap-1.5">
+        <input type="checkbox" bind:checked={enabled} />
+        {$tr("marketAlerts.enabled")}
+      </label>
+      <label class="flex items-center gap-1.5">
+        <input type="checkbox" bind:checked={native} />
+        {$tr("marketAlerts.desktopNotification")}
+      </label>
+    </div>
+  </section>
+
+  {#if error}
+    <p class="mt-3 text-sm text-danger">{$tr(error.key, error.params)}</p>
+  {/if}
+
+  <div class="mt-4 flex justify-end gap-2">
+    <button class="btn-secondary" onclick={() => onClose(false)}>{$tr("common.cancel")}</button>
+    <button class="btn-primary" data-alert-save disabled={saving} onclick={() => void save()}>
+      {$tr("common.save")}
+    </button>
+  </div>
+</div>

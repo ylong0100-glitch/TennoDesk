@@ -1,0 +1,21 @@
+# Normalize all text to LF on checkout, regardless of core.autocrlf.
+# CRLF trips prettier's endOfLine check and breaks knip's script parsing.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.webp binary
+*.dds binary
+*.ico binary
+*.wav binary
+*.onnx binary
+*.woff2 binary
+
+# Keep message data out of GitHub's language statistics while preserving diffs.
+src/i18n/*.json linguist-detectable=false
+
+# Generated from DE's own dictionaries; shipped, so tracked, but not our code.
+src/data/itemNames/*.json linguist-detectable=false linguist-generated=true
+
+# Generated from the wiki's enemy tables by build-codex-scan-data.mjs.
+src/data/codexScanRequirements.json linguist-detectable=false linguist-generated=true

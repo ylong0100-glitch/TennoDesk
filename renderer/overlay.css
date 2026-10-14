@@ -1,0 +1,760 @@
+:root {
+  --bg: color-mix(
+    in srgb,
+    color-mix(in oklab, var(--bg-deep, #060a12) 92%, transparent)
+      var(--overlay-opacity-current, 100%),
+    transparent
+  );
+  --surface: color-mix(
+    in srgb,
+    color-mix(in oklab, var(--bg-surface, #111827) 94%, transparent)
+      var(--overlay-opacity-current, 100%),
+    transparent
+  );
+  --border: color-mix(in oklab, var(--border-strong, rgba(212, 168, 67, 0.25)) 80%, transparent);
+  --accent: #d4a843;
+  --accent-bright: #f0c95c;
+  --text: var(--text-primary, #e8e4dc);
+  --muted: var(--text-secondary, #8b93a5);
+  --danger: #f87171;
+  --building: #fb923c;
+  --rare: #d4a843;
+  --uncommon: #94a3b8;
+  --common: #64748b;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* An html/body background would leak through a keep-mapped hide (Wayland, transparent Windows) as a dark box. */
+html,
+body {
+  background: transparent;
+  font-family: var(--font-body, "Barlow", "Segoe UI", system-ui, sans-serif);
+  font-size: var(--font-body-size, 0.82rem);
+  color: var(--text);
+  height: 100%;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+#panel {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background: color-mix(
+    in srgb,
+    var(--bg-surface, #111827) var(--overlay-opacity-current, 100%),
+    transparent
+  );
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  backdrop-filter: blur(8px);
+}
+
+#header {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 0;
+  background: transparent;
+  border-bottom: 0;
+}
+
+/* No app-region drag anywhere: Linux never refreshes the region, so a stale caption ate every click. */
+#header {
+  -webkit-app-region: no-drag;
+}
+
+.is-overlay-dragging,
+.is-overlay-dragging * {
+  cursor: grabbing !important;
+  user-select: none;
+}
+
+#btn-close {
+  -webkit-app-region: no-drag;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 18px;
+  cursor: pointer;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition:
+    color 0.15s,
+    background 0.15s;
+}
+
+#btn-close.is-hidden {
+  display: none;
+}
+
+#btn-close:hover {
+  color: var(--danger);
+  background: rgba(248, 113, 113, 0.1);
+}
+
+#scanning-state {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 14px 14px;
+  min-height: 52px;
+}
+
+#scanning-state.visible {
+  display: flex;
+}
+
+.scan-spinner {
+  width: 20px;
+  height: 20px;
+  border: 2px solid color-mix(in oklab, var(--accent) 22%, transparent);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  /* steps(): ~9 repaints/s - the window is software-rendered over the game. */
+  animation: spin 0.85s steps(8) infinite;
+  flex-shrink: 0;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+#scanning-text {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+#slots-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-auto-rows: max-content;
+  gap: 8px;
+  padding: 8px 10px 6px;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.planner-mode #header {
+  right: 14px;
+}
+
+#planner-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-auto-rows: max-content;
+  gap: 5px;
+  padding: 8px 10px 6px;
+  align-content: start;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+#planner-grid::-webkit-scrollbar {
+  width: 6px;
+}
+
+.planner-mode:has(#header > :not(.is-hidden)) #planner-grid {
+  padding-top: 30px;
+}
+
+#planner-grid::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.35);
+  border-radius: 3px;
+}
+
+#planner-grid::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.55);
+}
+
+#planner-grid.is-hidden {
+  display: none;
+}
+
+#planner-hint {
+  text-align: center;
+  font-size: 9.5px;
+  color: var(--muted);
+  padding: 4px 10px 6px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#drag-hint {
+  font-size: 9.5px;
+  color: var(--muted);
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(6, 10, 18, 0.72);
+  margin-right: 4px;
+  white-space: nowrap;
+  -webkit-app-region: no-drag;
+}
+
+#drag-hint.is-hidden {
+  display: none;
+}
+
+#planner-hint.is-hidden {
+  display: none;
+}
+
+.plan-card {
+  background: color-mix(in oklab, var(--surface) 94%, transparent);
+  border: 1px solid color-mix(in oklab, var(--border) 88%, transparent);
+  border-radius: 6px;
+  padding: 6px 8px;
+  min-height: 48px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 2px;
+}
+
+.plan-card.best {
+  border-color: color-mix(in oklab, var(--accent) 84%, white 16%);
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--accent) 30%, transparent);
+  background: color-mix(in oklab, var(--accent) 10%, var(--surface));
+}
+
+.plan-card.empty {
+  display: none;
+}
+
+.plan-title {
+  font-family: var(--font-display, "Rajdhani", "Segoe UI", system-ui, sans-serif);
+  font-size: 12px;
+  line-height: 1.2;
+  font-weight: 600;
+  color: var(--text);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  align-items: center;
+}
+
+.plan-rewards {
+  display: grid;
+  gap: 5px;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+
+.plan-rewards:not(:has([data-reward-field]:not(.reward-field-hidden))),
+.plan-reward:not(:has([data-reward-field]:not(.reward-field-hidden))) {
+  display: none;
+}
+
+.plan-reward {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  grid-template-rows: auto auto;
+  gap: 1px 4px;
+  min-height: 29px;
+  align-items: center;
+  font-size: 9px;
+}
+
+.plan-reward-icon {
+  width: 22px;
+  height: 22px;
+  grid-column: 1;
+  grid-row: 1 / 3;
+  display: inline-block;
+}
+
+.plan-reward-icon img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.plan-reward-name {
+  grid-column: 2 / 4;
+  grid-row: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+}
+
+/* Explicit cells, so a hidden neighbour cannot pull these into the icon column. */
+.plan-reward-chance {
+  grid-column: 2;
+  grid-row: 2;
+  color: var(--muted);
+}
+.plan-reward-owned {
+  grid-column: 3;
+  grid-row: 2;
+  color: var(--muted);
+  justify-self: end;
+}
+.plan-reward[data-rarity="rare"] .plan-reward-chance {
+  color: var(--rare);
+}
+.plan-reward[data-rarity="uncommon"] .plan-reward-chance {
+  color: var(--uncommon);
+}
+
+.plan-vault-tag {
+  display: inline-block;
+  margin-left: 5px;
+  padding: 0 4px;
+  border-radius: 3px;
+  border: 1px solid;
+  font-size: 8px;
+  line-height: 1.45;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  vertical-align: 1px;
+  white-space: nowrap;
+}
+
+.plan-vault-tag.vaulted {
+  color: var(--danger, #f87171);
+  border-color: color-mix(in oklab, var(--danger, #f87171) 45%, transparent);
+  background: color-mix(in oklab, var(--danger, #f87171) 16%, transparent);
+}
+
+.plan-vault-tag.unvaulted {
+  color: var(--info, #60a5fa);
+  border-color: color-mix(in oklab, var(--info, #60a5fa) 45%, transparent);
+  background: color-mix(in oklab, var(--info, #60a5fa) 16%, transparent);
+}
+
+.plan-profit {
+  color: var(--text);
+  font-size: 10px;
+  line-height: 1.1;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 4px;
+  flex-wrap: wrap;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.plan-currency-value,
+.slot-currency-value,
+.footer-currency-value {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.plan-currency-value img,
+.slot-currency-value img,
+.footer-currency-value img {
+  width: 14px;
+  height: 14px;
+  object-fit: contain;
+  flex-shrink: 0;
+}
+
+.currency-icon {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.slot-set-part-icon {
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+}
+
+.plan-profit-label {
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.plan-profit-plat {
+  color: var(--accent-bright);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.plan-profit-ducat {
+  color: color-mix(in oklab, var(--accent) 70%, #f7d47a 30%);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+#slots-grid.is-hidden {
+  display: none;
+}
+
+.reward-slot {
+  position: relative;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 5px 7px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  transition:
+    border-color 0.2s,
+    background 0.2s;
+  min-height: 92px;
+}
+
+.reward-slot.has-item {
+  border-color: rgba(212, 168, 67, 0.28);
+}
+
+.reward-slot.best-slot {
+  border-color: var(--accent);
+  background: rgba(212, 168, 67, 0.09);
+  box-shadow: 0 0 0 1px rgba(212, 168, 67, 0.22);
+}
+
+.reward-slot.empty-slot {
+  opacity: 0.42;
+}
+
+.slot-player {
+  align-self: flex-start;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.slot-name {
+  --slot-name-size: 14px;
+  font-size: calc(var(--slot-name-size) * var(--reward-fit-scale, 1));
+  color: var(--text);
+  line-height: 1.25;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  height: calc(var(--slot-name-size) * 2.5);
+  min-height: calc(var(--slot-name-size) * 2.5);
+  flex-shrink: 0;
+}
+
+.slot-name.empty {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.slot-price-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 0;
+  padding-top: 2px;
+}
+
+.slot-price-row .slot-price {
+  margin-left: auto;
+}
+
+.slot-rarity {
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.r-rare {
+  background: rgba(212, 168, 67, 0.2);
+  color: var(--rare);
+  border: 1px solid rgba(212, 168, 67, 0.45);
+}
+
+.r-uncommon {
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--uncommon);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+}
+
+.r-common {
+  background: rgba(71, 85, 105, 0.2);
+  color: var(--common);
+  border: 1px solid rgba(71, 85, 105, 0.35);
+}
+
+.slot-values {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent-bright);
+  white-space: nowrap;
+}
+
+.slot-values.muted {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.slot-plat-value {
+  color: var(--accent-bright);
+}
+
+.slot-ducat-value {
+  color: color-mix(in oklab, var(--accent) 76%, #f7d47a 24%);
+}
+
+.slot-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  min-height: 0;
+}
+
+.slot-meta-chip {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  padding: 1px 4px;
+  background: rgba(255, 255, 255, 0.045);
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.35;
+  font-weight: 600;
+}
+
+.slot-meta-chip.ducats {
+  color: color-mix(in oklab, var(--accent) 76%, #f7d47a 24%);
+}
+
+.slot-meta-chip.owned {
+  color: var(--text-secondary);
+}
+
+.slot-meta-chip.set,
+.slot-meta-chip.set-price {
+  color: var(--accent-bright);
+}
+
+.slot-meta-chip.building {
+  border-color: color-mix(in oklab, var(--building) 45%, transparent);
+  color: var(--building);
+}
+
+.slot-meta-chip.mastered {
+  border-color: color-mix(in oklab, #4ade80 40%, transparent);
+  color: #4ade80;
+}
+
+.slot-meta-chip.unmastered {
+  border-color: color-mix(in oklab, #38bdf8 40%, transparent);
+  color: #38bdf8;
+}
+
+.slot-meta-chip.vault-tag.vaulted {
+  border-color: color-mix(in oklab, var(--rare) 40%, transparent);
+  color: var(--rare);
+}
+
+.slot-meta-chip.vault-tag.unvaulted {
+  border-color: color-mix(in oklab, var(--uncommon) 40%, transparent);
+  color: var(--uncommon);
+}
+
+.slot-set-parts {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(68px, 1fr));
+  gap: 2px;
+  width: 100%;
+}
+
+.slot-set-part {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 5px;
+  padding: 3px 3px;
+  background: rgba(255, 255, 255, 0.045);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.2;
+  font-weight: 700;
+}
+
+.slot-set-part img {
+  width: 30px;
+  height: 30px;
+  object-fit: contain;
+  flex-shrink: 0;
+}
+
+.slot-set-part-fallback {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-secondary);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.slot-set-part.reward-fit-compact {
+  gap: 2px;
+}
+
+.slot-set-part.reward-fit-compact .slot-set-part-icon,
+.slot-set-part.reward-fit-compact img,
+.slot-set-part.reward-fit-compact .slot-set-part-fallback {
+  width: 20px;
+  height: 20px;
+}
+
+.slot-set-part.reward-fit-compact .slot-set-part-fallback {
+  font-size: 10px;
+}
+
+.slot-set-part-count {
+  min-width: 0;
+  font-size: calc(1em * var(--reward-fit-scale, 1));
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.slot-set-part.owned {
+  border-color: rgba(74, 222, 128, 0.28);
+  color: #86efac;
+}
+
+.slot-set-part.missing {
+  border-color: rgba(248, 113, 113, 0.22);
+  color: var(--muted);
+}
+
+.slot-set-part.is-reward {
+  border-color: var(--accent-bright);
+  background: color-mix(in oklab, var(--accent) 22%, transparent);
+}
+
+.slot-set-part.is-reward .slot-set-part-count {
+  color: var(--accent-bright);
+}
+
+/* One is already in the foundry - tints after owned/missing/is-reward. */
+.slot-set-part.building,
+.slot-set-part.building .slot-set-part-count {
+  border-color: color-mix(in oklab, var(--building) 55%, transparent);
+  color: var(--building);
+}
+
+#error-banner {
+  display: none;
+  margin: 0 12px 8px;
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  background: rgba(248, 113, 113, 0.08);
+  color: #fca5a5;
+  border-radius: 7px;
+  padding: 7px 10px;
+  font-size: 11px;
+}
+
+#error-banner.info {
+  border: 1px solid color-mix(in oklab, var(--accent) 42%, transparent);
+  background: color-mix(in oklab, var(--accent) 15%, transparent);
+  color: var(--text-secondary);
+}
+
+#error-banner.visible {
+  display: block;
+}
+
+#best-footer {
+  border-top: 1px solid var(--border);
+  padding: 5px 10px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+
+#best-label {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+#best-value {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: 1;
+  color: var(--accent-bright);
+  font-weight: 600;
+  white-space: nowrap;
+  min-width: 0;
+  overflow: visible;
+}
+
+#best-value > span:not(.footer-currency-value) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.footer-currency-value {
+  flex-shrink: 0;
+}
+
+#best-footer.is-hidden {
+  display: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

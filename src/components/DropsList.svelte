@@ -1,0 +1,290 @@
+<script lang="ts">
+  import { itemLabel } from "../lib/itemLabel.js";
+  import { SvelteSet } from "svelte/reactivity";
+
+  import { relicDb, relicOwnedCounts } from "../stores/relics.js";
+  import { activeComponent, openRelicDetailed } from "../stores/modals.js";
+  import { dropRarityColour } from "../lib/dropDisplay.js";
+  import { fissureTierClass, RELIC_ICON_PATHS, RELIC_QUALITY_SHORT_KEY } from "../lib/relic.js";
+  import { ownedRelicQualities, relicGroupForDisplayName } from "../lib/relic/relicInventory.js";
+  import { sortRelicRewards } from "../../config/shared/relicRewardOrder.js";
+  import { ownedRelicDropsFirst } from "../lib/resolveDrops.js";
+  import { buildWikiUrl } from "../lib/wikiUrl.js";
+  import WikiButton from "./WikiButton.svelte";
+  import { tr } from "../lib/i18n.js";
+  import type { DropInfo } from "../types/inventory.js";
+  import type { RelicDatabase, RelicGroup } from "../types/relics.js";
+
+  export let drops: DropInfo[];
+  /** Empty means "use the default heading", which has to stay translatable. */
+  export let title: string = "";
+  export let initialLimit: number = 5;
+  /** Localized item name used to open the Chinese Wiki's acquisition article. */
+  export let wikiName: string = "";
+
+  $: headingText = title || $tr("drops.acquisition");
+
+  let showAll = false;
+  let openRelicKey: string | null = null;
+
+  function computeDedupedDrops(drops: DropInfo[], db: RelicDatabase | null): DropInfo[] {
+    const out: DropInfo[] = [];
+    const seenRelicKeys = new SvelteSet<string>();
+
+    for (const d of drops) {
+      const rg = relicGroupForDisplayName(db, d.location);
+      if (!rg) {
+        out.push(d);
+        continue;
+      }
+
+      if (seenRelicKeys.has(rg.key)) continue;
+      const isBaseRow = !/\((Exceptional|Flawless|Radiant)\)\s*$/i.test(d.location);
+      if (!isBaseRow) continue;
+
+      seenRelicKeys.add(rg.key);
+      out.push(d);
+    }
+
+    for (const d of drops) {
+      const rg = relicGroupForDisplayName(db, d.location);
+      if (rg && !seenRelicKeys.has(rg.key)) {
+        seenRelicKeys.add(rg.key);
+        // Bare group name: the suffix is appended (translated) at render time,
+        // and relicGroupForDisplayName only strips the English "Relic".
+        out.push({ ...d, location: rg.name });
+      }
+    }
+
+    return out;
+  }
+
+  $: dedupedDrops = computeDedupedDrops(drops || [], $relicDb);
+  $: listedDrops = ownedRelicDropsFirst(dedupedDrops, $relicDb, $relicOwnedCounts);
+
+  let lastDropsKey = "";
+  $: {
+    const key = (drops || []).map((d) => d.location).join("|");
+    if (key !== lastDropsKey) {
+      // eslint-disable-next-line no-useless-assignment -- persists between reactive runs
+      lastDropsKey = key;
+      showAll = false;
+      openRelicKey = null;
+    }
+  }
+
+  function toggleRelic(ev: MouseEvent, key: string): void {
+    ev.preventDefault();
+    ev.stopPropagation();
+    openRelicKey = openRelicKey === key ? null : key;
+  }
+
+  function handleKeydown(e: KeyboardEvent, key: string): void {
+    if (e.key === "Escape") {
+      openRelicKey = null;
+      return;
+    }
+    if (e.key !== "Enter" && e.key !== " ") return;
+    e.preventDefault();
+    openRelicKey = openRelicKey === key ? null : key;
+  }
+
+  function relicFallbackIcon(rg: RelicGroup): string {
+    return RELIC_ICON_PATHS[fissureTierClass(rg.tier)] || RELIC_ICON_PATHS.default;
+  }
+
+  // rg.imageUrl can 404 (mirror gap / dead upstream); swap to the bundled tier icon
+  function onRelicImgError(event: Event, rg: RelicGroup): void {
+    const img = event.currentTarget as HTMLImageElement | null;
+    if (!img) return;
+    const fallback = relicFallbackIcon(rg);
+    if (!img.src.endsWith(fallback)) img.src = fallback;
+  }
+
+  function getPopoverRewards(rg: RelicGroup) {
+    const quality = rg.qualities?.intact ?? Object.values(rg.qualities ?? {})[0];
+    return sortRelicRewards(quality?.rewards ?? []);
+  }
+
+  function openDetailedRelic(rg: RelicGroup): void {
+    openRelicKey = null;
+    activeComponent.set(null);
+    openRelicDetailed(rg);
+  }
+
+  function openRelicWiki(rg: RelicGroup, ev: MouseEvent): void {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const url = buildWikiUrl(rg.name);
+    window.api?.openExternal?.(url);
+  }
+</script>
+
+{#if (dedupedDrops || []).length > 0}
+  <div class="detail-section">
+    <div class="flex items-center justify-between gap-2">
+      <h3>{headingText}</h3>
+      {#if wikiName}<WikiButton wikiUrl={null} fallbackName={wikiName} />{/if}
+    </div>
+    <div class="detail-acquisition">
+      {#each showAll ? listedDrops : listedDrops.slice(0, initialLimit) as d}
+        {@const rg = relicGroupForDisplayName($relicDb, d.location)}
+        {#if rg}
+          {@const ownedHere = ownedRelicQualities($relicOwnedCounts, rg.key)}
+          <button
+            type="button"
+            class="flex w-full items-center justify-between gap-2 px-2 -mx-2 py-1.5 rounded-md cursor-pointer text-left text-sm text-text-secondary border-b border-dashed border-border-subtle last:border-b-0 hover:bg-surface-hover hover:text-text-primary transition-colors {openRelicKey ===
+            rg.key
+              ? 'bg-surface-hover text-text-primary'
+              : ''}"
+            on:click={(e) => toggleRelic(e, rg.key)}
+            on:keydown={(e) => handleKeydown(e, rg.key)}
+          >
+            <span class="flex min-w-0 flex-wrap items-center gap-1.5">
+              <span class="text-text-primary">{rg.name} {$tr("drops.relicSuffix")}</span>
+              <span
+                class="vault-badge vault-badge--inline"
+                class:vault-badge--open={!rg.vaulted}
+                data-relic-vault={rg.vaulted ? "vaulted" : "unvaulted"}
+                title={rg.vaulted ? $tr("common.vaulted") : $tr("common.unvaulted")}
+                >{rg.vaulted ? "V" : "U"}</span
+              >
+              {#each ownedHere as entry (entry.quality)}
+                <span class="relic-owned-chip" data-relic-owned={entry.quality}
+                  >{$tr(RELIC_QUALITY_SHORT_KEY[entry.quality])} {entry.count}</span
+                >
+              {/each}
+            </span>
+            <span class="flex items-center gap-2 shrink-0">
+              {#if d.chance}<span class="text-accent text-xs">{d.chance.toFixed(1)}%</span>{/if}
+              {#if d.rarity}<span class="text-text-muted">({d.rarity})</span>{/if}
+              <span class="text-xs text-text-muted leading-none" aria-hidden="true">
+                {openRelicKey === rg.key ? "v" : ">"}
+              </span>
+            </span>
+          </button>
+
+          {#if openRelicKey === rg.key}
+            {@const rewards = getPopoverRewards(rg)}
+            <div
+              class="my-2 rounded-lg border border-border-strong bg-bg-raised px-3 py-2.5 shadow-[var(--ui-panel-shadow)]"
+            >
+              <div class="flex items-center gap-2 pb-2 mb-2 border-b border-border">
+                <img
+                  src={rg.imageUrl || relicFallbackIcon(rg)}
+                  alt={rg.name}
+                  class="w-8 h-8 object-contain shrink-0"
+                  on:error={(e) => onRelicImgError(e, rg)}
+                />
+                <div class="flex-1 min-w-0 flex flex-col gap-0.5">
+                  <span class="font-display text-sm font-semibold text-text-primary truncate"
+                    >{rg.name}</span
+                  >
+                  <span class="flex flex-wrap items-center gap-1.5">
+                    <span
+                      class="font-display text-xs font-bold tracking-wider px-1.5 py-0.5 rounded w-fit {rg.vaulted
+                        ? 'bg-danger/20 text-danger'
+                        : 'bg-info/15 text-info'}"
+                      data-relic-popover-vault={rg.vaulted ? "vaulted" : "unvaulted"}
+                    >
+                      {rg.vaulted ? $tr("common.vaulted") : $tr("common.unvaulted")}
+                    </span>
+                    {#each ownedHere as entry (entry.quality)}
+                      <span class="relic-owned-chip"
+                        >{$tr(RELIC_QUALITY_SHORT_KEY[entry.quality])} {entry.count}</span
+                      >
+                    {/each}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  class="shrink-0 self-start bg-transparent border-0 text-text-muted text-base leading-none cursor-pointer px-0.5 opacity-70 hover:opacity-100 hover:text-text-primary"
+                  aria-label={$tr("common.close")}
+                  on:click|stopPropagation={() => (openRelicKey = null)}>&times;</button
+                >
+              </div>
+
+              <div class="flex items-center gap-1.5 mb-2">
+                <button
+                  type="button"
+                  class="flex-1 px-2 py-1 text-xs font-display font-semibold tracking-wider rounded border border-accent/50 text-accent hover:bg-accent/10 hover:border-accent cursor-pointer transition-colors"
+                  on:click|stopPropagation={() => openDetailedRelic(rg)}
+                  >{$tr("common.detailed")}</button
+                >
+                <button
+                  type="button"
+                  class="flex-1 px-2 py-1 text-xs font-display font-semibold tracking-wider rounded border border-border-strong text-text-secondary hover:bg-surface-hover hover:text-text-primary cursor-pointer transition-colors"
+                  on:click={(e) => openRelicWiki(rg, e)}>{$tr("common.wiki")}</button
+                >
+              </div>
+
+              <div class="flex max-h-[240px] flex-col overflow-y-auto">
+                {#each rewards as r}
+                  <div
+                    class="flex items-center gap-2 py-1 border-b border-dashed border-border-subtle last:border-b-0"
+                  >
+                    {#if r.imageUrl}
+                      <img
+                        src={r.imageUrl}
+                        alt={itemLabel(r)}
+                        class="w-[22px] h-[22px] object-contain shrink-0 opacity-90"
+                      />
+                    {/if}
+                    <span class="flex-1 min-w-0 text-xs text-text-primary truncate"
+                      >{itemLabel(r)}</span
+                    >
+                    <span
+                      class="text-xs font-semibold shrink-0"
+                      style="color:{dropRarityColour(r.rarity)}"
+                    >
+                      {r.rarity}
+                    </span>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+        {:else}
+          <div
+            class="flex items-center justify-start gap-2 border-b border-dashed border-border-subtle py-1.5 last:border-b-0"
+          >
+            <span class="text-text-primary">{d.location}</span>
+            {#if d.chance}<span class="shrink-0 text-xs text-accent">{d.chance.toFixed(1)}%</span
+              >{/if}
+            {#if d.rarity}<span class="text-text-muted">({d.rarity})</span>{/if}
+          </div>
+        {/if}
+      {/each}
+      {#if !showAll && dedupedDrops.length > initialLimit}
+        <button
+          class="block w-full cursor-pointer border-0 bg-transparent py-1.5 text-left font-display text-xs text-accent opacity-85 hover:opacity-100 hover:underline"
+          data-drops-show-all
+          on:click={() => (showAll = true)}
+          >{$tr("drops.viewAllSources", { count: dedupedDrops.length })}</button
+        >
+      {:else if showAll && dedupedDrops.length > initialLimit}
+        <button
+          class="block w-full cursor-pointer border-0 bg-transparent py-1.5 text-left font-display text-xs text-accent opacity-85 hover:opacity-100 hover:underline"
+          on:click={() => (showAll = false)}>{$tr("common.showFewer")}</button
+        >
+      {/if}
+    </div>
+  </div>
+{/if}
+
+<style>
+  .relic-owned-chip {
+    display: inline-block;
+    border: 1px solid var(--success-dim);
+    border-radius: 999px;
+    background: var(--success-bg);
+    padding: 0 0.3rem;
+    font-family: var(--font-display);
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    line-height: 1.35;
+    color: var(--success);
+    white-space: nowrap;
+  }
+</style>
